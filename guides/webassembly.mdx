@@ -1,0 +1,480 @@
+---
+title: WebAssembly
+description: Build web-based RDP clients using IronRDP's WebAssembly bindings
+---
+
+IronRDP supports WebAssembly (WASM) as a first-class target, enabling full-featured RDP clients that run directly in web browsers. The `ironrdp-web` crate provides WASM bindings, and the `web-client` directory contains a production-ready Web Component and demo client.
+
+## Architecture
+
+The web stack consists of:
+
+- **`ironrdp-web`** - Rust WASM bindings compiled with `wasm-pack`
+- **`iron-remote-desktop`** - Reusable Web Component (framework-agnostic)
+- **`iron-remote-desktop-rdp`** - TypeScript implementation of RDP-specific logic
+- **`iron-svelte-client`** - Demo Svelte-based RDP client
+
+## Building the WASM Module
+
+<Steps>
+
+### Install required tools
+
+```shell
+cargo xtask wasm install
+```
+
+This installs:
+- `wasm-pack` - WASM build tool
+- `wasm-bindgen` - Rust/JS interop
+
+### Build the WASM module
+
+```shell
+cargo xtask wasm check
+```
+
+For production builds:
+
+```shell
+cd crates/ironrdp-web
+wasm-pack build --release --target web
+```
+
+This generates:
+```
+crates/ironrdp-web/pkg/
+├── ironrdp_web.js
+├── ironrdp_web_bg.wasm
+├── ironrdp_web.d.ts
+└── package.json
+```
+
+### Build the web client
+
+```shell
+cargo xtask web install  # Install npm dependencies
+cargo xtask web build     # Build the web client
+```
+
+### Run the demo client
+
+```shell
+cargo xtask web run
+```
+
+Open http://localhost:5173 in your browser.
+
+</Steps>
+
+## Using the WASM Bindings
+
+### Basic TypeScript Example
+
+```typescript
+import init, { Session, SessionBuilder } from './pkg/ironrdp_web.js';
+
+// Initialize WASM module
+await init();
+
+// Create session builder
+const builder = new SessionBuilder();
+builder.set_server_addr('server.example.com:3389');
+builder.set_username('user');
+builder.set_password('password');
+builder.set_desktop_size(1920, 1080);
+
+// Build session
+const session = await builder.build();
+
+// Connect
+await session.connect();
+console.log('Connected!');
+
+// Handle events
+session.on_graphics_update = (imageData: ImageData) => {
+    renderToCanvas(imageData);
+};
+
+session.on_terminated = (reason: string) => {
+    console.log('Session terminated:', reason);
+};
+
+// Send input
+session.send_mouse_event({
+    x: 100,
+    y: 200,
+    flags: MouseFlags.Move,
+});
+
+session.send_keyboard_event({
+    keyCode: 13, // Enter
+    flags: KeyboardFlags.Down,
+});
+```
+
+### Rendering to HTML5 Canvas
+
+```typescript
+const canvas = document.getElementById('rdp-canvas') as HTMLCanvasElement;
+const ctx = canvas.getContext('2d')!;
+
+session.on_graphics_update = (imageData: ImageData) => {
+    // Render the decoded image to canvas
+    ctx.putImageData(imageData, 0, 0);
+};
+```
+
+### Handling Input Events
+
+```typescript
+import { DeviceEvent, InputTransaction } from './pkg/ironrdp_web.js';
+
+// Mouse events
+canvas.addEventListener('mousemove', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+
+    const event = DeviceEvent.mouse_move(x, y);
+    const transaction = new InputTransaction();
+    transaction.add_event(event);
+    session.send_input(transaction);
+});
+
+canvas.addEventListener('mousedown', (e) => {
+    const event = DeviceEvent.mouse_button_down(e.button);
+    const transaction = new InputTransaction();
+    transaction.add_event(event);
+    session.send_input(transaction);
+});
+
+// Keyboard events
+window.addEventListener('keydown', (e) => {
+    e.preventDefault();
+    const event = DeviceEvent.keyboard_down(e.keyCode);
+    const transaction = new InputTransaction();
+    transaction.add_event(event);
+    session.send_input(transaction);
+});
+```
+
+## Using the Web Component
+
+The `iron-remote-desktop` Web Component provides a complete RDP client:
+
+```html
+<!DOCTYPE html>
+<html>
+<head>
+    <script type="module" src="./iron-remote-desktop/dist/index.js"></script>
+</head>
+<body>
+    <iron-remote-desktop
+        server="server.example.com:3389"
+        username="user"
+        password="password"
+        width="1920"
+        height="1080"
+    ></iron-remote-desktop>
+</body>
+</html>
+```
+
+### Web Component API
+
+```typescript
+const rdpClient = document.querySelector('iron-remote-desktop');
+
+// Connect
+await rdpClient.connect();
+
+// Disconnect
+rdpClient.disconnect();
+
+// Listen for events
+rdpClient.addEventListener('connected', () => {
+    console.log('Connected to RDP server');
+});
+
+rdpClient.addEventListener('disconnected', (e) => {
+    console.log('Disconnected:', e.detail.reason);
+});
+
+rdpClient.addEventListener('error', (e) => {
+    console.error('RDP error:', e.detail.message);
+});
+```
+
+## Svelte Integration
+
+The `iron-svelte-client` demonstrates full integration:
+
+```svelte
+<script lang="ts">
+  import IronRemoteDesktop from './iron-remote-desktop.svelte';
+
+  let server = 'localhost:3389';
+  let username = 'user';
+  let password = 'password';
+
+  function handleConnected() {
+    console.log('Connected to RDP server');
+  }
+
+  function handleError(event: CustomEvent) {
+    alert('RDP Error: ' + event.detail.message);
+  }
+</script>
+
+<IronRemoteDesktop
+  {server}
+  {username}
+  {password}
+  width={1920}
+  height={1080}
+  on:connected={handleConnected}
+  on:error={handleError}
+/>
+```
+
+## Advanced Features
+
+### Clipboard Support
+
+```typescript
+import { ClipboardData } from './pkg/ironrdp_web.js';
+
+// Handle clipboard from server
+session.on_clipboard_update = async (data: ClipboardData) => {
+    const text = await data.get_text();
+    await navigator.clipboard.writeText(text);
+    console.log('Clipboard updated:', text);
+};
+
+// Send clipboard to server
+navigator.clipboard.readText().then((text) => {
+    const clipboardData = ClipboardData.from_text(text);
+    session.send_clipboard(clipboardData);
+});
+```
+
+### Custom Network Transport
+
+Replace the default WebSocket transport:
+
+```typescript
+class CustomTransport {
+    async connect(url: string): Promise<void> {
+        // Custom connection logic
+    }
+
+    async send(data: Uint8Array): Promise<void> {
+        // Send data
+    }
+
+    async receive(): Promise<Uint8Array> {
+        // Receive data
+    }
+
+    async close(): Promise<void> {
+        // Close connection
+    }
+}
+
+const builder = new SessionBuilder();
+builder.set_transport(new CustomTransport());
+```
+
+### Touch Input Support
+
+```typescript
+canvas.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    const touch = e.touches[0];
+    const rect = canvas.getBoundingClientRect();
+    const x = touch.clientX - rect.left;
+    const y = touch.clientY - rect.top;
+
+    const event = DeviceEvent.mouse_button_down(0); // Left button
+    const moveEvent = DeviceEvent.mouse_move(x, y);
+
+    const transaction = new InputTransaction();
+    transaction.add_event(moveEvent);
+    transaction.add_event(event);
+    session.send_input(transaction);
+});
+```
+
+### Connection via Gateway
+
+Connect through a Devolutions Gateway or websockify proxy:
+
+```typescript
+const builder = new SessionBuilder();
+builder.set_gateway_url('wss://gateway.example.com/jet/rdp');
+builder.set_server_addr('internal-server:3389');
+builder.set_username('user');
+builder.set_password('password');
+```
+
+## Performance Optimization
+
+### WASM Streaming
+
+```typescript
+import init from './pkg/ironrdp_web.js';
+
+// Use streaming instantiation for faster loading
+await init('./pkg/ironrdp_web_bg.wasm');
+```
+
+### Worker Thread Processing
+
+```typescript
+// main.ts
+const worker = new Worker('./rdp-worker.js', { type: 'module' });
+
+worker.postMessage({
+    type: 'connect',
+    server: 'server.example.com:3389',
+    username: 'user',
+    password: 'password',
+});
+
+worker.onmessage = (e) => {
+    if (e.data.type === 'graphics_update') {
+        renderToCanvas(e.data.imageData);
+    }
+};
+
+// rdp-worker.ts
+import init, { Session } from './pkg/ironrdp_web.js';
+
+await init();
+
+self.onmessage = async (e) => {
+    if (e.data.type === 'connect') {
+        const session = await createSession(e.data);
+        // Process session in worker
+    }
+};
+```
+
+### Request Animation Frame
+
+```typescript
+let pendingUpdate: ImageData | null = null;
+
+session.on_graphics_update = (imageData: ImageData) => {
+    pendingUpdate = imageData;
+};
+
+function render() {
+    if (pendingUpdate) {
+        ctx.putImageData(pendingUpdate, 0, 0);
+        pendingUpdate = null;
+    }
+    requestAnimationFrame(render);
+}
+
+requestAnimationFrame(render);
+```
+
+## Debugging
+
+### Enable Console Logging
+
+```typescript
+import { set_panic_hook, set_log_level } from './pkg/ironrdp_web.js';
+
+// Enable panic traces
+set_panic_hook();
+
+// Set log level
+set_log_level('trace');
+```
+
+### Browser DevTools
+
+```typescript
+// Log WASM performance
+console.time('rdp-connect');
+await session.connect();
+console.timeEnd('rdp-connect');
+
+// Monitor memory usage
+setInterval(() => {
+    const memory = (performance as any).memory;
+    if (memory) {
+        console.log('Heap:', memory.usedJSHeapSize / 1048576, 'MB');
+    }
+}, 5000);
+```
+
+## Deployment
+
+### Static Hosting
+
+Deploy to any static host (Netlify, Vercel, GitHub Pages):
+
+```shell
+cargo xtask web build
+cd web-client/iron-svelte-client
+npm run build
+# Upload dist/ directory
+```
+
+### Headers Configuration
+
+For WASM to work, configure CORS headers:
+
+```
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
+
+### Service Worker Caching
+
+```javascript
+// service-worker.js
+self.addEventListener('install', (event) => {
+    event.waitUntil(
+        caches.open('ironrdp-v1').then((cache) => {
+            return cache.addAll([
+                '/ironrdp_web_bg.wasm',
+                '/ironrdp_web.js',
+                '/index.html',
+            ]);
+        })
+    );
+});
+```
+
+## Browser Compatibility
+
+IronRDP WASM works on:
+- ✅ Chrome/Edge 90+
+- ✅ Firefox 88+
+- ✅ Safari 15+
+- ✅ Mobile browsers (iOS Safari, Chrome Android)
+
+Requires:
+- WebAssembly
+- WebSocket (or alternative transport)
+- Canvas API
+- ES Modules
+
+## Production Examples
+
+Devolutions ships production IronRDP web clients in:
+
+- [**Devolutions Gateway**](https://github.com/Devolutions/devolutions-gateway/) - Standalone web interface (free, since v2024.1.0)
+- **Devolutions Server** - Self-hosted credential manager
+- **Devolutions Hub** - Cloud-based credential manager
+
+## Next Steps
+
+- [Building a Client](/guides/building-a-client) - Understand the underlying architecture
+- [Graphics Rendering](/guides/graphics-rendering) - Optimize canvas rendering
+- [Virtual Channels](/guides/virtual-channels) - Add clipboard and custom channels

@@ -1,0 +1,224 @@
+---
+title: ironrdp-rdpdr
+description: Device redirection virtual channel (RDPDR) implementation
+---
+
+The `ironrdp-rdpdr` crate implements the RDPDR static virtual channel for device redirection as specified in [MS-RDPEFS](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpefs/). This channel enables redirection of local devices (drives, smartcards, printers, ports) to the remote session.
+
+<Note>
+The RDPDR channel must always be advertised alongside the "rdpsnd" channel for the server to send anything back to it. See [MS-RDPEFS Appendix A\<1\>](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpefs/fd28bfd9-dae2-4a78-abe1-b4efa208b7aa#Appendix_A_1).
+</Note>
+
+## Overview
+
+The RDPDR channel multiplexes multiple device types over a single virtual channel. It handles device announcement, capability negotiation, and device-specific I/O operations.
+
+## Core Types
+
+### Rdpdr
+
+The main processor for the RDPDR channel.
+
+```rust
+pub struct Rdpdr {
+    computer_name: String,
+    capabilities: Capabilities,
+    device_list: Devices,
+    backend: Box<dyn RdpdrBackend>,
+}
+```
+
+**Constructor:**
+
+```rust
+impl Rdpdr {
+    pub const NAME: ChannelName = ChannelName::from_static(b"rdpdr\0\0\0");
+    
+    pub fn new(backend: Box<dyn RdpdrBackend>, computer_name: String) -> Self
+}
+```
+
+See: `ironrdp-rdpdr/src/lib.rs:34`
+
+**Configuration Methods:**
+
+- `with_smartcard(device_id: u32) -> Self` - Adds smartcard redirection capability
+- `with_drives(initial_drives: Option<Vec<(u32, String)>>) -> Self` - Adds drive redirection capability
+- `add_drive(device_id: u32, name: String) -> ClientDeviceListAnnounce` - Dynamically announces a new drive
+- `remove_device(device_id: u32) -> Option<ClientDeviceListRemove>` - Removes a device
+
+### Device Types
+
+Supported device types:
+
+```rust
+pub enum DeviceType {
+    Smartcard,    // Smart card readers
+    Filesystem,   // Shared drives/directories  
+    Printer,      // Printers
+    Serial,       // Serial ports
+    Parallel,     // Parallel ports
+}
+```
+
+## Usage Examples
+
+### Basic Setup
+
+```rust
+use ironrdp::rdpdr::{Rdpdr, NoopRdpdrBackend};
+
+// Create RDPDR processor with no-op backend
+let backend = Box::new(NoopRdpdrBackend);
+let rdpdr = Rdpdr::new(backend, "MYCOMPUTER".to_string());
+
+// Add to static virtual channels
+svc_processor.add_static_channel(rdpdr);
+```
+
+### Drive Redirection
+
+```rust
+use ironrdp::rdpdr::{Rdpdr, NoopRdpdrBackend};
+
+// Create with initial drives
+let initial_drives = vec![
+    (1, "C:".to_string()),
+    (2, "D:".to_string()),
+];
+
+let rdpdr = Rdpdr::new(backend, "MYCOMPUTER".to_string())
+    .with_drives(Some(initial_drives));
+
+// Dynamically add a drive later
+let announce_pdu = rdpdr.add_drive(3, "E:".to_string());
+send_to_channel(announce_pdu);
+```
+
+### Smartcard Redirection
+
+```rust
+let rdpdr = Rdpdr::new(backend, "MYCOMPUTER".to_string())
+    .with_smartcard(100);
+```
+
+## Backend Interface
+
+### RdpdrBackend
+
+The backend trait handles device-specific I/O operations:
+
+```rust
+pub trait RdpdrBackend: AsAny + core::fmt::Debug + Send {
+    fn handle_server_device_announce_response(
+        &mut self,
+        pdu: ServerDeviceAnnounceResponse,
+    ) -> PduResult<()>;
+    
+    fn handle_scard_call(
+        &mut self,
+        req: DeviceControlRequest<ScardIoCtlCode>,
+        call: ScardCall,
+    ) -> PduResult<()>;
+    
+    fn handle_drive_io_request(
+        &mut self,
+        req: ServerDriveIoRequest,
+    ) -> PduResult<Vec<SvcMessage>>;
+}
+```
+
+See: `ironrdp-rdpdr/src/backend.rs:1`
+
+### NoopRdpdrBackend
+
+A no-operation backend implementation for testing:
+
+```rust
+pub struct NoopRdpdrBackend;
+```
+
+## Protocol Flow
+
+### Initialization Sequence
+
+1. **Server Announce**: Server sends `VersionAndIdPdu` with `ServerAnnounceRequest`
+2. **Client Announce**: Client responds with `ClientAnnounceReply` and `ClientNameRequest`
+3. **Capabilities Exchange**: Server sends `CoreCapability` request, client responds
+4. **Client ID Confirm**: Server sends confirmation, client responds with `ClientDeviceListAnnounce`
+5. **Device Responses**: Server sends `ServerDeviceAnnounceResponse` for each device
+
+### Drive I/O Operations
+
+For filesystem devices, the channel supports:
+
+- `DeviceCreate` - Open files/directories
+- `DeviceClose` - Close file handles
+- `DeviceRead` - Read file data
+- `DeviceWrite` - Write file data  
+- `QueryInformation` - Get file metadata
+- `SetInformation` - Set file metadata
+- `QueryDirectory` - List directory contents
+- `QueryVolumeInformation` - Get volume information
+
+### Smartcard Operations
+
+For smartcard devices:
+
+- `ScardEstablishContext` - Initialize smartcard context
+- `ScardListReaders` - List available readers
+- `ScardConnect` - Connect to a card
+- `ScardTransmit` - Send APDU to card
+- `ScardDisconnect` - Disconnect from card
+- `ScardReleaseContext` - Release context
+
+## PDU Modules
+
+The crate organizes PDUs into submodules:
+
+### `pdu::efs`
+
+Enhanced File System (EFS) redirection PDUs from MS-RDPEFS:
+
+- `ClientDeviceListAnnounce` - Announce devices to server
+- `ServerDeviceAnnounceResponse` - Server response to device announcement
+- `DeviceIoRequest` - Generic I/O request structure
+- `ServerDriveIoRequest` - Drive-specific I/O operations
+- `Capabilities` - Client/server capabilities
+
+### `pdu::esc`
+
+Smartcard redirection PDUs from MS-RDPESC:
+
+- `ScardCall` - Smartcard API call types
+- `ScardIoCtlCode` - I/O control codes for smartcard operations
+- Device control request/response structures
+
+## Directory Display
+
+When directories are shared:
+
+```rust
+let rdpdr = Rdpdr::new(backend, "MYCOMPUTER".to_string())
+    .with_drives(Some(vec![
+        (1, "Documents".to_string()),
+    ]));
+```
+
+File Explorer displays them as:
+```
+Documents on MYCOMPUTER
+```
+
+The computer name is taken from the `computer_name` field passed to `Rdpdr::new()`.
+
+## Related Crates
+
+- **ironrdp-rdpdr-native**: Native platform implementations for drive and device redirection
+- **ironrdp-svc**: Static virtual channel infrastructure
+- **ironrdp-pdu**: Protocol data unit encoding/decoding
+
+## References
+
+- [MS-RDPEFS: Remote Desktop Protocol: File System Virtual Channel Extension](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpefs/)
+- [MS-RDPESC: Remote Desktop Protocol: Smart Card Virtual Channel Extension](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/)

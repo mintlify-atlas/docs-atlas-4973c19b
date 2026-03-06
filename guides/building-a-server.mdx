@@ -1,0 +1,381 @@
+---
+title: Building an RDP Server
+description: Create an RDP server using the ironrdp-server crate
+---
+
+IronRDP includes `ironrdp-server` for building custom RDP servers. This guide demonstrates how to create a basic server that accepts connections, handles authentication, and sends display updates.
+
+## Server Overview
+
+The `ironrdp-server` crate provides a high-level async API built on Tokio. A minimal server requires:
+
+1. **Input handler** - Process keyboard and mouse events from clients
+2. **Display handler** - Provide desktop size and frame updates
+3. **Security configuration** - TLS, NLA, or no security
+4. **Optional channel handlers** - Clipboard, audio, etc.
+
+## Basic Server Example
+
+Here's a complete working server (based on `examples/server.rs`):
+
+<Steps>
+
+### Define the input handler
+
+Implement `RdpServerInputHandler` to receive user input:
+
+```rust
+use ironrdp::server::{RdpServerInputHandler, KeyboardEvent, MouseEvent};
+
+#[derive(Clone, Debug)]
+struct Handler;
+
+impl RdpServerInputHandler for Handler {
+    fn keyboard(&mut self, event: KeyboardEvent) {
+        println!("Keyboard event: {:?}", event);
+    }
+
+    fn mouse(&mut self, event: MouseEvent) {
+        println!("Mouse event: {:?}", event);
+    }
+}
+```
+
+### Implement the display handler
+
+Provide desktop size and graphics updates:
+
+```rust
+use ironrdp::server::{RdpServerDisplay, RdpServerDisplayUpdates};
+use ironrdp::server::{DisplayUpdate, BitmapUpdate, PixelFormat};
+use ironrdp::connector::DesktopSize;
+use core::num::{NonZeroU16, NonZeroUsize};
+
+#[async_trait::async_trait]
+impl RdpServerDisplay for Handler {
+    async fn size(&mut self) -> DesktopSize {
+        DesktopSize {
+            width: 1920,
+            height: 1080,
+        }
+    }
+
+    async fn updates(&mut self) -> anyhow::Result<Box<dyn RdpServerDisplayUpdates>> {
+        Ok(Box::new(DisplayUpdates {}))
+    }
+}
+
+struct DisplayUpdates;
+
+#[async_trait::async_trait]
+impl RdpServerDisplayUpdates for DisplayUpdates {
+    async fn next_update(&mut self) -> anyhow::Result<Option<DisplayUpdate>> {
+        // Generate random colored rectangle as demo
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let x: u16 = 100;
+        let y: u16 = 100;
+        let width = NonZeroU16::new(200).unwrap();
+        let height = NonZeroU16::new(150).unwrap();
+
+        // Create RGBA bitmap data (200x150x4 bytes)
+        let mut data = vec![0u8; 200 * 150 * 4];
+        for i in 0..(200 * 150) {
+            data[i * 4] = 255;     // Blue
+            data[i * 4 + 1] = 0;   // Green
+            data[i * 4 + 2] = 0;   // Red
+            data[i * 4 + 3] = 255; // Alpha
+        }
+
+        let bitmap = BitmapUpdate {
+            x,
+            y,
+            width,
+            height,
+            format: PixelFormat::BgrA32,
+            data: data.into(),
+            stride: NonZeroUsize::new(200 * 4).unwrap(),
+        };
+
+        Ok(Some(DisplayUpdate::Bitmap(bitmap)))
+    }
+}
+```
+
+### Configure and build the server
+
+Set up security, credentials, and optional channels:
+
+```rust
+use ironrdp::server::{RdpServer, TlsIdentityCtx, Credentials};
+use std::net::SocketAddr;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let bind_addr: SocketAddr = "127.0.0.1:3389".parse()?;
+    let handler = Handler;
+
+    let server_builder = RdpServer::builder()
+        .with_addr(bind_addr);
+
+    // Configure security mode
+    let server_builder = if let Some((cert_path, key_path)) = get_tls_paths() {
+        let identity = TlsIdentityCtx::init_from_paths(cert_path, key_path)?;
+        let acceptor = identity.make_acceptor()?;
+
+        // Use hybrid mode (TLS + NLA)
+        server_builder.with_hybrid(acceptor, identity.pub_key)
+    } else {
+        // No security (for testing only)
+        server_builder.with_no_security()
+    };
+
+    let mut server = server_builder
+        .with_input_handler(handler.clone())
+        .with_display_handler(handler)
+        .build();
+
+    // Set required credentials
+    server.set_credentials(Some(Credentials {
+        username: "user".to_owned(),
+        password: "pass".to_owned(),
+        domain: None,
+    }));
+
+    println!("Server listening on {}", bind_addr);
+    server.run().await
+}
+```
+
+### Run the server
+
+```shell
+cargo run --example=server
+```
+
+Connect with any RDP client:
+
+```shell
+# Using IronRDP client
+cargo run --bin ironrdp-client -- 127.0.0.1 -u user -p pass
+
+# Using Microsoft RDP client
+mstsc /v:127.0.0.1
+```
+
+</Steps>
+
+## Security Modes
+
+### No Security (Testing Only)
+
+```rust
+let server_builder = RdpServer::builder()
+    .with_addr(bind_addr)
+    .with_no_security();
+```
+
+**Warning**: Only use for local testing. Never expose to networks.
+
+### TLS Only
+
+```rust
+let identity = TlsIdentityCtx::init_from_paths("cert.pem", "key.pem")?;
+let acceptor = identity.make_acceptor()?;
+
+let server_builder = RdpServer::builder()
+    .with_addr(bind_addr)
+    .with_tls(acceptor);
+```
+
+### Hybrid (TLS + NLA/CredSSP)
+
+Most secure, recommended for production:
+
+```rust
+let identity = TlsIdentityCtx::init_from_paths("cert.pem", "key.pem")?;
+let acceptor = identity.make_acceptor()?;
+
+let server_builder = RdpServer::builder()
+    .with_addr(bind_addr)
+    .with_hybrid(acceptor, identity.pub_key);
+```
+
+## Virtual Channel Support
+
+### Adding Clipboard Support
+
+```rust
+use ironrdp::cliprdr::backend::{CliprdrBackend, CliprdrBackendFactory};
+use ironrdp::server::{CliprdrServerFactory, ServerEventSender, ServerEvent};
+use ironrdp::server::tokio::sync::mpsc::UnboundedSender;
+use ironrdp_cliprdr_native::StubCliprdrBackend;
+
+struct MyCliprdrFactory;
+
+impl CliprdrBackendFactory for MyCliprdrFactory {
+    fn build_cliprdr_backend(&self) -> Box<dyn CliprdrBackend> {
+        Box::new(StubCliprdrBackend::new())
+    }
+}
+
+impl ServerEventSender for MyCliprdrFactory {
+    fn set_sender(&mut self, _sender: UnboundedSender<ServerEvent>) {}
+}
+
+impl CliprdrServerFactory for MyCliprdrFactory {}
+
+let cliprdr = Box::new(MyCliprdrFactory);
+
+let server = server_builder
+    .with_input_handler(handler.clone())
+    .with_display_handler(handler)
+    .with_cliprdr_factory(Some(cliprdr))
+    .build();
+```
+
+### Adding Audio Output (RDPSND)
+
+```rust
+use ironrdp::rdpsnd::pdu::{AudioFormat, WaveFormat};
+use ironrdp::rdpsnd::server::{RdpsndServerHandler, RdpsndServerMessage};
+use ironrdp::server::SoundServerFactory;
+
+struct AudioHandler;
+
+impl RdpsndServerHandler for AudioHandler {
+    fn get_formats(&self) -> &[AudioFormat] {
+        &[
+            AudioFormat {
+                format: WaveFormat::PCM,
+                n_channels: 2,
+                n_samples_per_sec: 44100,
+                n_avg_bytes_per_sec: 176400,
+                n_block_align: 4,
+                bits_per_sample: 16,
+                data: None,
+            },
+        ]
+    }
+
+    fn start(&mut self, client_format: &ClientAudioFormatPdu) -> Option<u16> {
+        // Start audio streaming
+        Some(0) // Format index
+    }
+
+    fn stop(&mut self) {
+        // Stop audio streaming
+    }
+}
+
+struct AudioFactory;
+
+impl SoundServerFactory for AudioFactory {
+    fn build_backend(&self) -> Box<dyn RdpsndServerHandler> {
+        Box::new(AudioHandler)
+    }
+}
+
+impl ServerEventSender for AudioFactory {
+    fn set_sender(&mut self, sender: UnboundedSender<ServerEvent>) {
+        // Store sender to push audio frames
+    }
+}
+
+let sound = Box::new(AudioFactory);
+
+let server = server_builder
+    .with_sound_factory(Some(sound))
+    .build();
+```
+
+## Advanced Display Updates
+
+### Efficient Frame Generation
+
+For real-world servers, generate updates based on actual screen content:
+
+```rust
+impl RdpServerDisplayUpdates for MyDisplayUpdates {
+    async fn next_update(&mut self) -> anyhow::Result<Option<DisplayUpdate>> {
+        // Wait for next frame from screen capture
+        let frame = self.screen_capture.next_frame().await?;
+
+        // Only send changed regions (dirty rectangles)
+        if let Some(dirty_rect) = frame.changed_region {
+            let bitmap = BitmapUpdate {
+                x: dirty_rect.x,
+                y: dirty_rect.y,
+                width: dirty_rect.width,
+                height: dirty_rect.height,
+                format: PixelFormat::BgrA32,
+                data: frame.pixels.into(),
+                stride: frame.stride,
+            };
+            Ok(Some(DisplayUpdate::Bitmap(bitmap)))
+        } else {
+            // No changes, wait a bit
+            tokio::time::sleep(Duration::from_millis(16)).await;
+            Ok(None)
+        }
+    }
+}
+```
+
+## Credentials and Authentication
+
+Set allowed credentials before running:
+
+```rust
+server.set_credentials(Some(Credentials {
+    username: "admin".to_owned(),
+    password: "secure_password".to_owned(),
+    domain: Some("WORKGROUP".to_owned()),
+}));
+```
+
+For multiple users, implement custom authentication logic in the server's connection handler.
+
+## Running in Production
+
+### Generate TLS Certificate
+
+```shell
+# Self-signed certificate (testing)
+openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
+
+# Production: use certificates from a trusted CA
+```
+
+### Environment Configuration
+
+```rust
+let bind_addr = std::env::var("RDP_BIND_ADDR")
+    .unwrap_or_else(|_| "0.0.0.0:3389".to_owned())
+    .parse()?;
+
+let cert_path = std::env::var("RDP_TLS_CERT")?;
+let key_path = std::env::var("RDP_TLS_KEY")?;
+```
+
+### Logging
+
+```rust
+use tracing_subscriber::EnvFilter;
+
+tracing_subscriber::fmt()
+    .with_env_filter(EnvFilter::from_env("IRONRDP_LOG"))
+    .init();
+```
+
+Run with logging:
+
+```shell
+IRONRDP_LOG=info cargo run --release
+```
+
+## Next Steps
+
+- [Virtual Channels](/guides/virtual-channels) - Implement custom channels
+- [Graphics Rendering](/guides/graphics-rendering) - Optimize display updates
+- [Async I/O](/guides/async-io) - Understand the async architecture

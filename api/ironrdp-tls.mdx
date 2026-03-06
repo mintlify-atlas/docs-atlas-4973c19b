@@ -1,0 +1,337 @@
+---
+title: ironrdp-tls
+description: TLS upgrade utilities for IronRDP clients
+---
+
+`ironrdp-tls` provides TLS boilerplate common to most IronRDP clients, offering a clean abstraction over different TLS backends with deliberate backend selection.
+
+## Overview
+
+This crate handles TLS connection upgrades for RDP connections by:
+
+- Supporting multiple TLS backends (rustls, native-tls)
+- Extracting server certificates for RDP protocol verification
+- Configuring TLS appropriately for RDP (no resumption, no cert verification)
+- Providing a stub backend for testing
+
+## Backend Selection
+
+The crate uses **mutually exclusive features** to select exactly one TLS backend:
+
+```toml
+[dependencies]
+# Choose exactly one:
+ironrdp-tls = { version = "0.2", features = ["rustls"] }
+ironrdp-tls = { version = "0.2", features = ["native-tls"] }
+ironrdp-tls = { version = "0.2", features = ["stub"] }
+```
+
+<Warning>
+  Enabling multiple backends simultaneously will cause a **compile-time error**. This is intentional and prevents accidental misconfiguration.
+</Warning>
+
+### Why This Design?
+
+This explicit selection approach has several benefits:
+
+1. **Deliberate choice**: It's obvious which backend is enabled by looking at dependencies
+2. **No defaults to disable**: No need for `default-features = false`
+3. **Easier re-export**: When re-exposing features, you don't need to disable defaults
+4. **Prevents mistakes**: Cannot accidentally enable multiple backends
+
+## Available Backends
+
+### rustls Backend
+
+Uses the pure-Rust `rustls` TLS implementation:
+
+```toml
+[dependencies]
+ironrdp-tls = { version = "0.2", features = ["rustls"] }
+```
+
+**Advantages:**
+- Pure Rust (no C dependencies)
+- Memory safe
+- Supports SSLKEYLOGFILE for Wireshark debugging
+- Works on all platforms
+
+**Dependencies:**
+- `tokio-rustls`: Tokio integration for rustls
+- `x509-cert`: Certificate parsing
+
+### native-tls Backend
+
+Uses platform-native TLS implementations:
+
+```toml
+[dependencies]
+ironrdp-tls = { version = "0.2", features = ["native-tls"] }
+```
+
+**Platform mappings:**
+- **Windows**: SChannel
+- **macOS**: Secure Transport
+- **Linux**: OpenSSL
+
+**Advantages:**
+- Uses platform TLS (may be required for compliance)
+- Smaller binary size
+- Leverages system certificate stores
+
+**Dependencies:**
+- `tokio-native-tls`: Tokio integration
+- `x509-cert`: Certificate parsing
+
+### stub Backend
+
+A no-op implementation for testing and compile-time checking:
+
+```toml
+[dependencies]
+ironrdp-tls = { version = "0.2", features = ["stub"] }
+```
+
+<Warning>
+  The stub backend will **panic at runtime** if you attempt to use it. It's only for making code compile with minimal dependencies during development.
+</Warning>
+
+## Usage
+
+The API is identical regardless of backend:
+
+```rust
+use ironrdp_tls::{upgrade, TlsStream};
+use tokio::net::TcpStream;
+
+// Connect to server
+let stream = TcpStream::connect("rdp.example.com:3389").await?;
+
+// Upgrade to TLS
+let (tls_stream, cert) = upgrade(stream, "rdp.example.com").await?;
+
+// Use the TLS stream for RDP protocol
+let mut framed = TokioFramed::new(tls_stream);
+```
+
+### TlsStream Type
+
+The `TlsStream<S>` type alias points to the backend-specific TLS stream:
+
+```rust
+// With rustls feature:
+pub type TlsStream<S> = tokio_rustls::client::TlsStream<S>;
+
+// With native-tls feature:
+pub type TlsStream<S> = tokio_native_tls::TlsStream<S>;
+```
+
+This allows your code to be backend-agnostic while still getting concrete types.
+
+## Extracting Server Public Key
+
+RDP requires the server's public key for protocol validation:
+
+```rust
+use ironrdp_tls::{upgrade, extract_tls_server_public_key};
+
+let (tls_stream, cert) = upgrade(stream, server_name).await?;
+
+// Extract public key from certificate
+let public_key = extract_tls_server_public_key(&cert)
+    .ok_or("server certificate has no public key")?;
+
+// Use public key in RDP connection sequence
+let result = connect_finalize(
+    /* ... */,
+    public_key.to_vec(),
+    /* ... */
+).await?;
+```
+
+## TLS Configuration
+
+The crate configures TLS appropriately for RDP:
+
+### Certificate Verification
+
+RDP clients typically **do not verify** server certificates through standard CA chains. Instead:
+
+- Certificates are accepted without validation
+- The server public key is extracted
+- RDP protocol-level validation occurs later
+
+This matches how native RDP clients work and allows self-signed certificates.
+
+### rustls Configuration
+
+```rust
+let mut config = rustls::client::ClientConfig::builder()
+    .dangerous()
+    .with_custom_certificate_verifier(NoCertificateVerification)
+    .with_no_client_auth();
+
+// Enable SSLKEYLOGFILE for debugging
+config.key_log = Arc::new(rustls::KeyLogFile::new());
+
+// Disable session resumption (not supported by CredSSP)
+config.resumption = rustls::client::Resumption::disabled();
+```
+
+### native-tls Configuration
+
+```rust
+let connector = tokio_native_tls::native_tls::TlsConnector::builder()
+    .danger_accept_invalid_certs(true)
+    .use_sni(false)
+    .build()?;
+```
+
+### Why No Session Resumption?
+
+The CredSSP protocol used by RDP does not support TLS session resumption:
+
+> The CredSSP Protocol does not extend the TLS wire protocol. TLS session resumption is not supported.
+>
+> — [MS-CSSP § 1 Overview](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-cssp/385a7489-d46b-464c-b224-f7340e308a5c)
+
+## Complete Connection Example
+
+```rust
+use ironrdp_tls::{upgrade, extract_tls_server_public_key};
+use ironrdp_tokio::{TokioFramed, connect_begin, mark_as_upgraded, connect_finalize};
+use ironrdp_connector::{ClientConnector, ServerName};
+use tokio::net::TcpStream;
+
+// Initial TCP connection
+let stream = TcpStream::connect("rdp.example.com:3389").await?;
+let mut framed = TokioFramed::new(stream);
+
+// Phase 1: Pre-TLS negotiation
+let should_upgrade = connect_begin(&mut framed, &mut connector).await?;
+
+// Phase 2: TLS upgrade
+let (stream, leftover) = framed.into_inner();
+let (tls_stream, cert) = upgrade(stream, "rdp.example.com").await?;
+
+let server_public_key = extract_tls_server_public_key(&cert)
+    .ok_or("no server public key")?;
+
+// Phase 3: Post-TLS finalization
+let mut framed = TokioFramed::new_with_leftover(tls_stream, leftover);
+let upgraded = mark_as_upgraded(should_upgrade, &mut connector);
+
+let result = connect_finalize(
+    upgraded,
+    connector,
+    &mut framed,
+    &mut network_client,
+    ServerName::new("rdp.example.com"),
+    server_public_key.to_vec(),
+    None,
+).await?;
+```
+
+## Debugging TLS with SSLKEYLOGFILE
+
+When using the `rustls` backend, you can decrypt TLS traffic in Wireshark:
+
+```bash
+# Set environment variable
+export SSLKEYLOGFILE=/tmp/sslkeys.log
+
+# Run your RDP client
+cargo run
+
+# Configure Wireshark:
+# Edit → Preferences → Protocols → TLS
+# Set "(Pre)-Master-Secret log filename" to /tmp/sslkeys.log
+```
+
+This is extremely useful for debugging RDP protocol issues.
+
+## Error Handling
+
+The `upgrade` function returns `io::Result<(TlsStream<S>, Certificate)>`:
+
+```rust
+match upgrade(stream, server_name).await {
+    Ok((tls_stream, cert)) => {
+        // Success
+    }
+    Err(e) => {
+        // Handle TLS errors:
+        // - Connection errors
+        // - Handshake failures
+        // - Invalid server name
+        eprintln!("TLS upgrade failed: {}", e);
+    }
+}
+```
+
+## Re-exporting in Your Crate
+
+If you're building a library that uses IronRDP, you can re-export the TLS backend features:
+
+```toml
+[features]
+rustls = ["ironrdp-tls/rustls"]
+native-tls = ["ironrdp-tls/native-tls"]
+stub-tls = ["ironrdp-tls/stub"]
+
+[dependencies]
+ironrdp-tls = "0.2"
+```
+
+Users of your library can then choose:
+
+```toml
+mylib = { version = "1.0", features = ["rustls"] }
+```
+
+## When to Use Each Backend
+
+### Choose rustls when:
+
+- Building cross-platform applications
+- Want pure Rust dependencies
+- Need memory safety guarantees
+- Want SSLKEYLOGFILE debugging support
+- Prefer explicit TLS implementation
+
+### Choose native-tls when:
+
+- Need platform TLS for compliance
+- Want smaller binary sizes
+- Leveraging system certificate stores
+- Targeting enterprise environments with specific TLS requirements
+
+### Choose stub when:
+
+- Writing tests that don't need real TLS
+- Checking that code compiles without TLS dependencies
+- Building for constrained environments
+
+<Warning>
+  Never use the stub backend in production code.
+</Warning>
+
+## Dependencies
+
+Common dependencies:
+- **tokio**: Async runtime
+
+With `rustls` feature:
+- **tokio-rustls**: Tokio + rustls integration
+- **x509-cert**: Certificate parsing
+
+With `native-tls` feature:
+- **tokio-native-tls**: Tokio + native TLS integration
+- **x509-cert**: Certificate parsing
+
+## Related Crates
+
+- [ironrdp-tokio](/api/ironrdp-tokio) - Tokio runtime integration
+- [ironrdp-futures](/api/ironrdp-futures) - futures runtime integration
+- [ironrdp-async](/api/ironrdp-async) - Core async abstractions
+- [ironrdp-connector](/api/ironrdp-connector) - Connection state machines

@@ -1,0 +1,268 @@
+---
+title: ironrdp-tokio
+description: Tokio runtime integration for IronRDP async I/O
+---
+
+`ironrdp-tokio` provides Tokio runtime integration for IronRDP, implementing the framing traits from `ironrdp-async` using Tokio's async I/O primitives.
+
+## Overview
+
+This crate bridges IronRDP's async abstractions with the Tokio runtime by:
+
+- Implementing `FramedRead` and `FramedWrite` for Tokio streams
+- Providing specialized stream wrappers with different `Send` semantics
+- Offering optional HTTP client integration via reqwest
+
+## Quick Start
+
+```rust
+use ironrdp_tokio::TokioFramed;
+use tokio::net::TcpStream;
+
+let stream = TcpStream::connect("rdp.example.com:3389").await?;
+let framed = TokioFramed::new(stream);
+```
+
+## Stream Wrappers
+
+The crate provides three stream wrapper types with different trait bounds:
+
+### TokioStream (Send + Sync)
+
+For streams that are both `Send` and `Sync`, enabling use across threads:
+
+```rust
+use ironrdp_tokio::{TokioFramed, TokioStream};
+
+pub type TokioFramed<S> = Framed<TokioStream<S>>;
+
+let framed = TokioFramed::new(stream);
+
+// Can be sent across threads
+tokio::spawn(async move {
+    let (action, frame) = framed.read_pdu().await?;
+    // Process frame
+});
+```
+
+**Type bounds**: `S: Send + Sync + Unpin + AsyncRead/AsyncWrite`
+
+### LocalTokioStream (Local)
+
+For local (non-`Send`) streams like `LocalSet` tasks:
+
+```rust
+use ironrdp_tokio::{LocalTokioFramed, LocalTokioStream};
+
+pub type LocalTokioFramed<S> = Framed<LocalTokioStream<S>>;
+
+let framed = LocalTokioFramed::new(stream);
+
+// Use within LocalSet
+let local = tokio::task::LocalSet::new();
+local.run_until(async move {
+    let (action, frame) = framed.read_pdu().await?;
+});
+```
+
+**Type bounds**: `S: Unpin + AsyncRead/AsyncWrite` (no `Send` requirement)
+
+### MovableTokioStream (Send)
+
+For streams that are `Send` but not `Sync`:
+
+```rust
+use ironrdp_tokio::{MovableTokioFramed, MovableTokioStream};
+
+pub type MovableTokioFramed<S> = Framed<MovableTokioStream<S>>;
+
+let framed = MovableTokioFramed::new(stream);
+
+// Can move across threads but not share references
+tokio::spawn(async move {
+    let (action, frame) = framed.read_pdu().await?;
+});
+```
+
+**Type bounds**: `S: Send + Unpin + AsyncRead/AsyncWrite`
+
+## Splitting Streams
+
+Split a framed stream into separate read and write halves:
+
+```rust
+use ironrdp_tokio::{split_tokio_framed, unsplit_tokio_framed};
+
+let framed = TokioFramed::new(stream);
+
+// Split into independent halves
+let (mut reader, mut writer) = split_tokio_framed(framed);
+
+// Use independently (e.g., in different tasks)
+tokio::spawn(async move {
+    let (action, frame) = reader.read_pdu().await?;
+    // Process frame
+});
+
+tokio::spawn(async move {
+    writer.write_all(&pdu_bytes).await?;
+});
+
+// Rejoin when needed
+let framed = unsplit_tokio_framed(reader, writer);
+```
+
+Splitting is useful for:
+
+- Concurrent reading and writing
+- Separate read/write task responsibilities
+- Pipeline architectures
+
+## FramedRead Implementation
+
+The `TokioStream` implements `FramedRead` using Tokio's `AsyncReadExt::read_buf`:
+
+```rust
+impl<S> FramedRead for TokioStream<S>
+where
+    S: Send + Sync + Unpin + AsyncRead,
+{
+    fn read<'a>(&'a mut self, buf: &'a mut BytesMut) -> impl Future {
+        self.inner.read_buf(buf)  // Efficient direct read into BytesMut
+    }
+}
+```
+
+This leverages Tokio's optimized `read_buf` for zero-copy reading into `BytesMut` buffers.
+
+## FramedWrite Implementation
+
+The `TokioStream` implements `FramedWrite` with automatic flushing:
+
+```rust
+impl<S> FramedWrite for TokioStream<S>
+where
+    S: Send + Sync + Unpin + AsyncWrite,
+{
+    fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> impl Future {
+        async {
+            self.inner.write_all(buf).await?;
+            self.inner.flush().await?;  // Ensures data is sent
+            Ok(())
+        }
+    }
+}
+```
+
+The automatic flush ensures frames are sent immediately, which is important for RDP's request-response patterns.
+
+## HTTP Client Integration
+
+With the `reqwest` feature, get an HTTP client for network authentication:
+
+```rust
+use ironrdp_tokio::reqwest::build_http_client;
+
+let http_client = build_http_client()?;
+
+// Use for CredSSP network requests
+let response = http_client.get(url).send().await?;
+```
+
+### Features
+
+- **`reqwest`**: Enables reqwest-based HTTP client (base feature)
+- **`reqwest-rustls-ring`**: Use rustls with ring crypto for TLS
+- **`reqwest-native-tls`**: Use native platform TLS
+
+Select one TLS backend:
+
+```toml
+[dependencies]
+ironrdp-tokio = { version = "0.8", features = ["reqwest-rustls-ring"] }
+```
+
+## Complete Connection Example
+
+```rust
+use ironrdp_tokio::{TokioFramed, connect_begin, mark_as_upgraded, connect_finalize};
+use ironrdp_connector::ClientConnector;
+use ironrdp_tls::upgrade;
+use tokio::net::TcpStream;
+
+// Connect to RDP server
+let stream = TcpStream::connect("rdp.example.com:3389").await?;
+let mut framed = TokioFramed::new(stream);
+
+// Initial connection negotiation
+let should_upgrade = connect_begin(&mut framed, &mut connector).await?;
+
+// Extract stream and perform TLS upgrade
+let (stream, leftover) = framed.into_inner();
+let (tls_stream, server_cert) = upgrade(stream, "rdp.example.com").await?;
+let server_public_key = extract_tls_server_public_key(&server_cert)
+    .ok_or("no public key")?;
+
+// Continue with upgraded stream
+let mut framed = TokioFramed::new_with_leftover(tls_stream, leftover);
+let upgraded = mark_as_upgraded(should_upgrade, &mut connector);
+
+// Finalize connection (CredSSP, etc.)
+let result = connect_finalize(
+    upgraded,
+    connector,
+    &mut framed,
+    &mut network_client,
+    ServerName::new("rdp.example.com"),
+    server_public_key.to_vec(),
+    None,  // kerberos_config
+).await?;
+```
+
+## Performance Considerations
+
+Tokio integration provides excellent performance:
+
+- **Zero-copy reads**: `read_buf` writes directly into `BytesMut`
+- **Efficient buffering**: Minimal allocations via `bytes` crate
+- **Optimal scheduling**: Tokio's work-stealing scheduler handles multiple connections efficiently
+
+## When to Use
+
+Use `ironrdp-tokio` when:
+
+- Building with the Tokio ecosystem
+- Need high-performance async I/O
+- Want integration with Tokio libraries (hyper, tonic, etc.)
+- Require concurrent connection handling
+
+For other runtimes, use [ironrdp-futures](/api/ironrdp-futures) instead.
+
+For blocking I/O, use [ironrdp-blocking](/api/ironrdp-blocking).
+
+## Dependencies
+
+- **ironrdp-async**: Core async abstractions (re-exported)
+- **tokio**: Async runtime (with `io-util` features)
+- **bytes**: Efficient byte buffers
+- **reqwest** (optional): HTTP client for network auth
+- **sspi** (optional): Windows authentication
+- **url** (optional): URL parsing
+
+## Re-exports
+
+This crate re-exports all of `ironrdp-async`:
+
+```rust
+pub use ironrdp_async::*;
+```
+
+You can use all async traits, types, and functions directly from `ironrdp_tokio`.
+
+## Related Crates
+
+- [ironrdp-async](/api/ironrdp-async) - Core async abstractions
+- [ironrdp-futures](/api/ironrdp-futures) - futures runtime integration
+- [ironrdp-blocking](/api/ironrdp-blocking) - Blocking I/O alternative
+- [ironrdp-tls](/api/ironrdp-tls) - TLS upgrade helpers
+- [ironrdp-connector](/api/ironrdp-connector) - Connection state machines

@@ -1,0 +1,285 @@
+---
+title: Building an RDP Client
+description: Learn how to build an RDP client using IronRDP with blocking or async I/O
+---
+
+IronRDP provides flexible APIs for building RDP clients, supporting both blocking and asynchronous I/O patterns. This guide walks through creating a basic client that connects to an RDP server and processes graphics updates.
+
+## Client Architecture
+
+An IronRDP client consists of three main phases:
+
+1. **Connection** - Establish TCP connection and negotiate RDP protocol parameters
+2. **Authentication** - Perform TLS upgrade and CredSSP authentication
+3. **Active Session** - Process incoming PDUs and handle graphics/input
+
+## Blocking Client Example
+
+Here's how to build a basic blocking client that captures a screenshot (based on `examples/screenshot.rs`):
+
+<Steps>
+
+### Configure the connection
+
+Create a `connector::Config` with your server details and credentials:
+
+```rust
+use ironrdp::connector::{self, Credentials, DesktopSize};
+use ironrdp::pdu::gcc::KeyboardType;
+use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
+use ironrdp_pdu::rdp::client_info::PerformanceFlags;
+
+let config = connector::Config {
+    credentials: Credentials::UsernamePassword {
+        username: "user".to_owned(),
+        password: "pass".to_owned(),
+    },
+    domain: None,
+    enable_tls: false,
+    enable_credssp: true,
+    keyboard_type: KeyboardType::IbmEnhanced,
+    keyboard_subtype: 0,
+    keyboard_layout: 0,
+    keyboard_functional_keys_count: 12,
+    desktop_size: DesktopSize {
+        width: 1280,
+        height: 1024,
+    },
+    client_name: "my-rdp-client".to_owned(),
+    client_build: 0,
+    platform: MajorPlatformType::UNIX,
+    performance_flags: PerformanceFlags::default(),
+    // ... additional fields
+};
+```
+
+### Establish the connection
+
+Connect to the server using `ironrdp-blocking`:
+
+```rust
+use std::net::TcpStream;
+use ironrdp_blocking::Framed;
+
+// Connect TCP
+let tcp_stream = TcpStream::connect(("server.example.com", 3389))?;
+let client_addr = tcp_stream.local_addr()?;
+
+let mut framed = Framed::new(tcp_stream);
+let mut connector = connector::ClientConnector::new(config, client_addr);
+
+// Begin connection sequence
+let should_upgrade = ironrdp_blocking::connect_begin(&mut framed, &mut connector)?;
+```
+
+### Perform TLS upgrade
+
+Upgrade the connection to TLS:
+
+```rust
+use tokio_rustls::rustls;
+
+// Get raw stream before TLS upgrade
+let initial_stream = framed.into_inner_no_leftover();
+
+// Configure TLS (simplified - see full example for certificate verification)
+let mut tls_config = rustls::client::ClientConfig::builder()
+    .dangerous()
+    .with_custom_certificate_verifier(/* ... */)
+    .with_no_client_auth();
+
+tls_config.resumption = rustls::client::Resumption::disabled();
+
+let server_name = "server.example.com".try_into()?;
+let client = rustls::ClientConnection::new(Arc::new(tls_config), server_name)?;
+let mut tls_stream = rustls::StreamOwned::new(client, initial_stream);
+tls_stream.flush()?;
+
+// Extract server public key for CredSSP
+let cert = tls_stream.conn.peer_certificates()
+    .and_then(|certs| certs.first())
+    .context("peer certificate is missing")?;
+let server_public_key = extract_server_public_key(cert)?;
+
+// Mark as upgraded and create new framed wrapper
+let upgraded = ironrdp_blocking::mark_as_upgraded(should_upgrade, &mut connector);
+let mut upgraded_framed = Framed::new(tls_stream);
+```
+
+### Finalize connection
+
+Complete authentication and connection finalization:
+
+```rust
+use sspi::network_client::reqwest_network_client::ReqwestNetworkClient;
+
+let mut network_client = ReqwestNetworkClient;
+let connection_result = ironrdp_blocking::connect_finalize(
+    upgraded,
+    connector,
+    &mut upgraded_framed,
+    &mut network_client,
+    "server.example.com".into(),
+    server_public_key,
+    None, // kerberos_config
+)?;
+```
+
+### Process the active session
+
+Handle incoming graphics updates and session events:
+
+```rust
+use ironrdp::session::{ActiveStage, ActiveStageOutput};
+use ironrdp::session::image::DecodedImage;
+
+let mut image = DecodedImage::new(
+    ironrdp_graphics::image_processing::PixelFormat::RgbA32,
+    connection_result.desktop_size.width,
+    connection_result.desktop_size.height,
+);
+
+let mut active_stage = ActiveStage::new(connection_result);
+
+loop {
+    let (action, payload) = match framed.read_pdu() {
+        Ok(result) => result,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+        Err(e) => return Err(e.into()),
+    };
+
+    let outputs = active_stage.process(&mut image, action, &payload)?;
+
+    for out in outputs {
+        match out {
+            ActiveStageOutput::ResponseFrame(frame) => {
+                framed.write_all(&frame)?;
+            }
+            ActiveStageOutput::Terminate(_) => break,
+            _ => {}
+        }
+    }
+}
+```
+
+### Save the result
+
+Extract and save the rendered image:
+
+```rust
+let img: image::ImageBuffer<image::Rgba<u8>, _> =
+    image::ImageBuffer::from_raw(
+        u32::from(image.width()),
+        u32::from(image.height()),
+        image.data()
+    )?;
+
+img.save("screenshot.png")?;
+```
+
+</Steps>
+
+## Async Client with Tokio
+
+For asynchronous clients, use `ironrdp-async` and `ironrdp-tokio`:
+
+```rust
+use ironrdp_tokio::TokioFramed;
+use tokio::net::TcpStream;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let tcp_stream = TcpStream::connect(("server.example.com", 3389)).await?;
+    let client_addr = tcp_stream.local_addr()?;
+
+    let mut framed = TokioFramed::new(tcp_stream);
+    let mut connector = connector::ClientConnector::new(config, client_addr);
+
+    let should_upgrade = ironrdp_async::connect_begin(&mut framed, &mut connector).await?;
+
+    // TLS upgrade...
+    let upgraded = ironrdp_async::mark_as_upgraded(should_upgrade, &mut connector);
+
+    let connection_result = ironrdp_async::connect_finalize(
+        upgraded,
+        connector,
+        &mut upgraded_framed,
+        &mut network_client,
+        server_name,
+        server_public_key,
+        None,
+    ).await?;
+
+    // Active session processing is similar but uses async read/write
+    Ok(())
+}
+```
+
+## Full-Featured Client
+
+For a production-ready client with:
+- Window management (using `winit`)
+- Software rendering (using `softbuffer`)
+- Input handling
+- Clipboard support
+
+See the [`ironrdp-client`](https://github.com/Devolutions/IronRDP/tree/master/crates/ironrdp-client) crate source code.
+
+## Key Configuration Options
+
+### Performance Flags
+
+Optimize for different scenarios:
+
+```rust
+use ironrdp_pdu::rdp::client_info::PerformanceFlags;
+
+config.performance_flags = PerformanceFlags::default()
+    .with_desktop_composition(true)
+    .with_font_smoothing(true);
+```
+
+### Compression
+
+Enable graphics compression:
+
+```rust
+use ironrdp_pdu::rdp::client_info::CompressionType;
+
+config.compression_type = Some(CompressionType::Rdp61); // Best compression
+```
+
+### Desktop Size
+
+Specify custom resolution:
+
+```rust
+config.desktop_size = DesktopSize {
+    width: 1920,
+    height: 1080,
+};
+```
+
+## Error Handling
+
+IronRDP uses `ironrdp::connector::ConnectorError` for connection errors and session-specific errors during the active stage:
+
+```rust
+use ironrdp::connector::{ConnectorError, ConnectorErrorKind};
+
+match connector_result {
+    Err(ConnectorError { kind: ConnectorErrorKind::Credssp(e), .. }) => {
+        eprintln!("Authentication failed: {}", e);
+    }
+    Err(e) => {
+        eprintln!("Connection error: {}", e);
+    }
+    Ok(_) => {}
+}
+```
+
+## Next Steps
+
+- [Virtual Channels](/guides/virtual-channels) - Add clipboard, audio, and custom channels
+- [Graphics Rendering](/guides/graphics-rendering) - Optimize graphics decoding
+- [Async I/O](/guides/async-io) - Build high-performance async clients

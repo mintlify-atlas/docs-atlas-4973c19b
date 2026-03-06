@@ -1,0 +1,302 @@
+---
+title: ironrdp-rdpsnd
+description: Audio output redirection virtual channel (RDPSND) implementation
+---
+
+The `ironrdp-rdpsnd` crate implements the RDPSND static virtual channel for audio output redirection as specified in [MS-RDPEA](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpea/). This channel enables playback of remote audio on the local machine.
+
+## Overview
+
+The RDPSND channel handles audio format negotiation, volume control, and streaming audio data from server to client. It supports multiple audio formats including PCM, ADPCM, and OPUS.
+
+## Architecture
+
+The crate provides both client and server implementations:
+
+- **Client** (`client` module): Receives and plays audio from remote server
+- **Server** (`server` module): Sends audio to remote client
+
+## Client API
+
+### Rdpsnd
+
+The client-side RDPSND processor.
+
+```rust
+pub struct Rdpsnd {
+    handler: Box<dyn RdpsndClientHandler>,
+    state: RdpsndState,
+    server_format: Option<ServerAudioFormatPdu>,
+}
+```
+
+**Constructor:**
+
+```rust
+impl Rdpsnd {
+    pub const NAME: ChannelName = ChannelName::from_static(b"rdpsnd\0\0");
+    
+    pub fn new(handler: Box<dyn RdpsndClientHandler>) -> Self
+}
+```
+
+See: `ironrdp-rdpsnd/src/client.rs:58`
+
+### RdpsndClientHandler
+
+Trait for handling audio output operations:
+
+```rust
+pub trait RdpsndClientHandler: Send + core::fmt::Debug {
+    fn get_flags(&self) -> AudioFormatFlags;
+    fn get_formats(&self) -> &[AudioFormat];
+    fn wave(&mut self, format_no: usize, ts: u32, data: Cow<'_, [u8]>);
+    fn set_volume(&mut self, volume: VolumePdu);
+    fn set_pitch(&mut self, pitch: PitchPdu);
+    fn close(&mut self);
+}
+```
+
+See: `ironrdp-rdpsnd/src/client.rs:13`
+
+**Methods:**
+
+- `get_flags()` - Returns supported capability flags (e.g., `VOLUME`, `PITCH`)
+- `get_formats()` - Returns list of supported audio formats
+- `wave()` - Called when audio data arrives for playback
+- `set_volume()` - Called when volume change is requested
+- `set_pitch()` - Called when pitch change is requested  
+- `close()` - Called when audio channel is closed
+
+## Server API
+
+### RdpsndServer
+
+The server-side RDPSND processor.
+
+```rust
+pub struct RdpsndServer {
+    handler: Box<dyn RdpsndServerHandler>,
+    state: RdpsndState,
+    client_format: Option<ClientAudioFormatPdu>,
+    quality_mode: Option<QualityMode>,
+    block_no: u8,
+    format_no: Option<u16>,
+}
+```
+
+**Constructor:**
+
+```rust
+impl RdpsndServer {
+    pub const NAME: ChannelName = ChannelName::from_static(b"rdpsnd\0\0");
+    
+    pub fn new(handler: Box<dyn RdpsndServerHandler>) -> Self
+}
+```
+
+See: `ironrdp-rdpsnd/src/server.rs:50`
+
+**Key Methods:**
+
+- `wave(data: Vec<u8>, ts: u32)` - Sends audio data to client
+- `set_volume(volume_left: u16, volume_right: u16)` - Sets client volume
+- `close()` - Closes the audio channel
+
+### RdpsndServerHandler
+
+Trait for handling server-side audio operations:
+
+```rust
+pub trait RdpsndServerHandler: Send + core::fmt::Debug {
+    fn get_formats(&self) -> &[AudioFormat];
+    fn start(&mut self, client_format: &ClientAudioFormatPdu) -> Option<u16>;
+    fn stop(&mut self);
+}
+```
+
+See: `ironrdp-rdpsnd/src/server.rs:31`
+
+## Audio Formats
+
+```rust
+pub struct AudioFormat {
+    pub format: WaveFormat,
+    pub n_channels: u16,
+    pub n_samples_per_sec: u32,
+    pub n_avg_bytes_per_sec: u32,
+    pub n_block_align: u16,
+    pub bits_per_sample: u16,
+    pub data: Option<Vec<u8>>,
+}
+
+pub enum WaveFormat {
+    PCM = 0x0001,
+    ADPCM = 0x0002,
+    ALAW = 0x0006,
+    MULAW = 0x0007,
+    GSM610 = 0x0031,
+    AAC = 0x00A106,
+    OPUS = 0x0069,
+}
+```
+
+## Usage Examples
+
+### Client Implementation
+
+```rust
+use ironrdp::rdpsnd::client::{Rdpsnd, RdpsndClientHandler};
+use ironrdp::rdpsnd::pdu::{AudioFormat, WaveFormat};
+
+struct MyAudioHandler {
+    // Audio output device handle
+}
+
+impl RdpsndClientHandler for MyAudioHandler {
+    fn get_formats(&self) -> &[AudioFormat] {
+        &[
+            AudioFormat {
+                format: WaveFormat::PCM,
+                n_channels: 2,
+                n_samples_per_sec: 44100,
+                n_avg_bytes_per_sec: 176400,
+                n_block_align: 4,
+                bits_per_sample: 16,
+                data: None,
+            },
+            AudioFormat {
+                format: WaveFormat::OPUS,
+                n_channels: 2,
+                n_samples_per_sec: 48000,
+                n_avg_bytes_per_sec: 192000,
+                n_block_align: 4,
+                bits_per_sample: 16,
+                data: None,
+            },
+        ]
+    }
+    
+    fn wave(&mut self, format_no: usize, ts: u32, data: Cow<'_, [u8]>) {
+        // Play audio data through output device
+        self.play_audio(&data);
+    }
+    
+    fn set_volume(&mut self, volume: VolumePdu) {
+        // Adjust output volume
+    }
+    
+    fn set_pitch(&mut self, pitch: PitchPdu) {
+        // Adjust pitch (rarely used)
+    }
+    
+    fn close(&mut self) {
+        // Close audio device
+    }
+}
+
+// Create and register channel
+let handler = Box::new(MyAudioHandler::new());
+let rdpsnd = Rdpsnd::new(handler);
+svc_processor.add_static_channel(rdpsnd);
+```
+
+### Server Implementation
+
+```rust
+use ironrdp::rdpsnd::server::{RdpsndServer, RdpsndServerHandler};
+
+struct MyServerAudioHandler;
+
+impl RdpsndServerHandler for MyServerAudioHandler {
+    fn get_formats(&self) -> &[AudioFormat] {
+        &[
+            AudioFormat {
+                format: WaveFormat::PCM,
+                n_channels: 2,
+                n_samples_per_sec: 44100,
+                n_avg_bytes_per_sec: 176400,
+                n_block_align: 4,
+                bits_per_sample: 16,
+                data: None,
+            },
+        ]
+    }
+    
+    fn start(&mut self, client_format: &ClientAudioFormatPdu) -> Option<u16> {
+        // Find compatible format
+        for (idx, fmt) in client_format.formats.iter().enumerate() {
+            if self.get_formats().contains(fmt) {
+                return Some(idx as u16);
+            }
+        }
+        None
+    }
+    
+    fn stop(&mut self) {
+        // Stop audio capture
+    }
+}
+
+// Send audio data
+let data = capture_audio();
+let messages = rdpsnd_server.wave(data, timestamp)?;
+send_messages(messages);
+```
+
+## Protocol Flow
+
+### Initialization (Client)
+
+1. Server sends `ServerAudioFormatPdu` with supported formats
+2. Client responds with `ClientAudioFormatPdu` containing intersected formats
+3. If version >= V6, client sends `QualityModePdu`
+4. Server sends `TrainingPdu` with test audio
+5. Client responds with `TrainingConfirmPdu`
+6. Channel enters `Ready` state
+
+### Audio Streaming
+
+1. Server sends `Wave2Pdu` (v8+) or `WavePdu` (v7-) with audio data
+2. Client handler receives data via `wave()` callback
+3. Client sends `WaveConfirmPdu` to acknowledge receipt
+4. Server continues streaming subsequent blocks
+
+### Version-Specific Behavior
+
+- **Version 2-5**: Basic audio streaming
+- **Version 6+**: Adds quality mode support
+- **Version 8+**: Uses `Wave2Pdu` format with audio timestamp
+
+## PDU Types
+
+Key protocol data units:
+
+- `ServerAudioFormatPdu` - Server's supported audio formats
+- `ClientAudioFormatPdu` - Client's supported audio formats
+- `WavePdu` / `Wave2Pdu` - Audio data packets
+- `WaveConfirmPdu` - Acknowledgment from client
+- `TrainingPdu` / `TrainingConfirmPdu` - Audio latency testing
+- `VolumePdu` - Volume control
+- `PitchPdu` - Pitch control
+- `QualityModePdu` - Audio quality settings
+
+## Quality Modes
+
+```rust
+pub enum QualityMode {
+    High = 0x0000,    // High quality, more bandwidth
+    Medium = 0x0001,  // Medium quality
+    Dynamic = 0x0002, // Adaptive based on bandwidth
+}
+```
+
+## Related Crates
+
+- **ironrdp-rdpsnd-native**: Platform-specific audio output implementations
+- **ironrdp-svc**: Static virtual channel infrastructure
+- **ironrdp-pdu**: Protocol data unit encoding/decoding
+
+## References
+
+- [MS-RDPEA: Remote Desktop Protocol: Audio Output Virtual Channel Extension](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpea/)

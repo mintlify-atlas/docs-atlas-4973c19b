@@ -1,0 +1,254 @@
+---
+title: RDP Protocol Overview
+description: Understanding the Remote Desktop Protocol architecture and security models
+---
+
+The Remote Desktop Protocol (RDP) is Microsoft's proprietary protocol for remote desktop access, enabling graphical session control over network connections. IronRDP provides a robust, security-focused implementation in Rust.
+
+## Protocol Architecture
+
+RDP operates as a multi-layered protocol stack, with each layer providing specific functionality:
+
+### Transport Layer (TPKT/TPDU)
+
+The foundation uses ISO transport protocols:
+- **TPKT** (RFC 1006): Provides packet framing over TCP
+- **TPDU** (ISO 8073): Connection-Oriented Transport Protocol
+
+IronRDP implements these in `ironrdp-pdu/src/tpkt.rs` and `ironrdp-pdu/src/tpdu.rs`.
+
+### Connection Layer (X.224)
+
+X.224 handles connection establishment and data transfer. The protocol begins with a Connection Request (CR) and Connection Confirm (CC) exchange.
+
+```rust
+// From ironrdp-connector
+let connection_request = nego::ConnectionRequest {
+    nego_data: Some(nego::NegoRequestData::cookie(username)),
+    flags: nego::RequestFlags::empty(),
+    protocol: security_protocol,
+};
+```
+
+See `ironrdp-pdu/src/x224.rs` for the X.224 implementation.
+
+### MCS Layer (T.125)
+
+Multipoint Communication Service (MCS) manages multiple channels over a single connection:
+- **Domain attachment**: Client joins an MCS domain
+- **Channel management**: Up to 32 static channels (including the mandatory I/O channel)
+- **User attachment**: Associates users with channels
+
+The MCS layer is implemented in `ironrdp-pdu/src/mcs.rs` using ASN.1 PER encoding (`ironrdp-pdu/src/per.rs`).
+
+### RDP Layer
+
+The application layer handles:
+- Capability negotiation
+- Graphics rendering
+- Input event processing
+- Virtual channel data
+
+## Security Protocols
+
+IronRDP enforces modern security practices by design.
+
+### Standard RDP Security (Deprecated)
+
+The legacy RC4-based security is **not supported** in IronRDP:
+
+```rust
+if security_protocol.is_standard_rdp_security() {
+    return Err(reason_err!("Initiation", "standard RDP security is not supported"));
+}
+```
+
+**Why?** Standard RDP Security exposes significant attack surface:
+- No pre-authentication
+- Full session establishment before credential validation
+- Vulnerable to MITM attacks
+- Exposes static channels (clipboard, drive redirection, etc.) to attackers
+
+See `ironrdp-connector/src/connection.rs:266-268`.
+
+### Enhanced RDP Security (TLS)
+
+TLS wraps the RDP connection after X.224 negotiation:
+
+```rust
+if self.config.enable_tls {
+    security_protocol.insert(nego::SecurityProtocol::SSL);
+}
+```
+
+This mode still shows a graphical login screen, initiating the full Windows login subsystem (winlogon.exe, GDI, LogonUI.exe) before authentication completes. While more secure than Standard RDP, it remains vulnerable because:
+- The entire RDP session is established pre-authentication
+- All static channels are joined and active
+- Server and client attack surfaces are exposed
+
+<Note>
+**Security Recommendation**: Set `enable_tls` to `false` to enforce NLA when connecting to CredSSP-capable servers.
+</Note>
+
+### Network Level Authentication (CredSSP)
+
+NLA using CredSSP provides authentication **before** session establishment:
+
+```rust
+if self.config.enable_credssp {
+    security_protocol.insert(
+        nego::SecurityProtocol::HYBRID | nego::SecurityProtocol::HYBRID_EX
+    );
+}
+```
+
+Benefits:
+- Authentication occurs before RDP session initialization
+- Dramatically reduced attack surface
+- Early user authorization result PDU support (HYBRID_EX)
+- Server can deny access before credentials are fully submitted
+
+IronRDP uses the `sspi` crate for CredSSP implementation. See `ironrdp-connector/src/credssp.rs`.
+
+## Protocol Phases
+
+RDP connection establishment follows a strict sequence:
+
+<Steps>
+
+### Connection Initiation
+
+Client and server negotiate security protocols via X.224 Connection Request/Confirm.
+
+```rust
+// ironrdp-connector/src/connection.rs:270-279
+let connection_request = nego::ConnectionRequest {
+    nego_data: self.config.request_data.clone().or_else(|| {
+        self.config.credentials.username()
+            .map(|username| nego::NegoRequestData::cookie(username.to_owned()))
+    }),
+    flags: nego::RequestFlags::empty(),
+    protocol: security_protocol,
+};
+```
+
+### Enhanced Security Upgrade
+
+TLS handshake occurs here (handled externally by user code in IronRDP).
+
+### CredSSP (Optional)
+
+Network Level Authentication via CredSSP if negotiated.
+
+### Basic Settings Exchange
+
+Client and server exchange GCC (Global Conference Control) blocks via MCS Connect-Initial and Connect-Response PDUs:
+
+- **Client Core Data**: Desktop size, color depth, keyboard layout, client name
+- **Client Security Data**: Encryption methods
+- **Client Network Data**: Requested static virtual channels
+- **Server Core Data**: RDP version, early capability flags
+- **Server Security Data**: Server random, certificates
+- **Server Network Data**: Assigned channel IDs
+
+See `ironrdp-connector/src/connection.rs:638-738` for GCC block creation.
+
+### Channel Connection
+
+Each static channel is joined using MCS Channel Join Request/Confirm. The server may skip this step if it advertises `SKIP_CHANNELJOIN_SUPPORTED`.
+
+### Secure Settings Exchange
+
+Client sends Client Info PDU containing:
+- Username, password, domain
+- Compression preferences
+- Alternate shell and working directory
+- Client address and timezone
+- Performance flags
+
+See `ironrdp-connector/src/connection.rs:741-815`.
+
+### Licensing Exchange
+
+Server sends licensing information. IronRDP supports license caching via the `LicenseCache` trait.
+
+### Capabilities Exchange
+
+Server sends Demand Active PDU with capability sets:
+- General capabilities
+- Bitmap capabilities
+- Order capabilities
+- Virtual channel capabilities
+- Pointer capabilities
+- Input capabilities
+
+Client responds with Confirm Active PDU.
+
+### Connection Finalization
+
+Client and server exchange finalization PDUs:
+- Synchronize PDU
+- Control Cooperate PDU
+- Control Granted Control PDU
+- Font Map PDU
+
+</Steps>
+
+## PDU Structure
+
+All RDP PDUs follow this basic structure:
+
+```
+[ TPKT Header (4 bytes) ]
+[ X.224 Data TPDU (3 bytes) ]
+[ MCS PDU (variable) ]
+  [ Security Header (variable) ]
+  [ Share Control Header (6 bytes) ]
+  [ Share Data Header (variable) ]
+  [ PDU-specific data ]
+```
+
+IronRDP uses a trait-based encoding/decoding system:
+
+```rust
+pub trait Encode {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()>;
+    fn name(&self) -> &'static str;
+    fn size(&self) -> usize;
+}
+
+pub trait Decode {
+    fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self>;
+}
+```
+
+See `ironrdp-core` for core encoding primitives.
+
+## Configuration Example
+
+```rust
+use ironrdp_connector::{Config, Credentials, DesktopSize};
+
+let config = Config {
+    desktop_size: DesktopSize { width: 1920, height: 1080 },
+    enable_tls: false,           // Disable TLS to enforce NLA
+    enable_credssp: true,        // Enable NLA for security
+    credentials: Credentials::UsernamePassword {
+        username: "user".to_string(),
+        password: "pass".to_string(),
+    },
+    domain: Some("DOMAIN".to_string()),
+    // ... other fields
+};
+```
+
+## References
+
+- [MS-RDPBCGR]: Remote Desktop Protocol: Basic Connectivity and Graphics Remoting
+- [MS-RDPELE]: Remote Desktop Protocol: Licensing Extension  
+- [MS-CSSP]: Credential Security Support Provider Protocol
+- IronRDP Architecture: `ARCHITECTURE.md` in the source repository
+
+<Note>
+IronRDP enforces strict architectural invariants: core tier crates (including `ironrdp-pdu`, `ironrdp-connector`, `ironrdp-session`) never perform I/O, remain `no_std`-compatible, and avoid platform-specific code.
+</Note>

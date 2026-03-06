@@ -1,0 +1,383 @@
+---
+title: ironrdp-acceptor
+description: State machines to drive an RDP connection acceptance sequence
+---
+
+## Overview
+
+`ironrdp-acceptor` provides state machines that drive the server-side RDP connection acceptance sequence. It handles the complex multi-phase negotiation and setup required to establish an RDP connection from the server perspective.
+
+**Key Features:**
+- Complete connection acceptance state machine
+- Security protocol negotiation (TLS, Hybrid, Hybrid-EX)
+- CredSSP authentication handling
+- Channel connection management
+- Capability exchange coordination
+- Connection finalization
+
+## Installation
+
+```toml
+[dependencies]
+ironrdp-acceptor = "0.8"
+```
+
+**Requirements:**
+- Tokio async runtime
+
+## Core Concepts
+
+### Acceptor State Machine
+
+The `Acceptor` struct implements the `Sequence` trait and progresses through multiple states:
+
+```rust
+use ironrdp_acceptor::{Acceptor, AcceptorState, AcceptorResult};
+use ironrdp_pdu::nego::SecurityProtocol;
+use ironrdp_connector::DesktopSize;
+
+let mut acceptor = Acceptor::new(
+    SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX,
+    DesktopSize { width: 1920, height: 1080 },
+    capabilities,  // Vec<CapabilitySet>
+    Some(credentials),  // Optional<Credentials>
+);
+```
+
+### Connection Acceptance States
+
+The acceptor progresses through these states:
+
+1. **InitiationWaitRequest** - Wait for X.224 Connection Request
+2. **InitiationSendConfirm** - Send X.224 Connection Confirm
+3. **SecurityUpgrade** - Negotiate security protocol
+4. **Credssp** - Perform CredSSP authentication (if using Hybrid)
+5. **BasicSettingsWaitInitial** - Wait for MCS Connect Initial
+6. **BasicSettingsSendResponse** - Send MCS Connect Response
+7. **ChannelConnection** - Join MCS channels
+8. **RdpSecurityCommencement** - Begin RDP security
+9. **SecureSettingsExchange** - Exchange client info
+10. **LicensingExchange** - Send license packet
+11. **CapabilitiesSendServer** - Send Demand Active PDU
+12. **MonitorLayoutSend** - Send monitor layout (optional)
+13. **CapabilitiesWaitConfirm** - Wait for Confirm Active
+14. **ConnectionFinalization** - Finalize connection
+15. **Accepted** - Connection established
+
+## Usage
+
+### Basic Connection Acceptance
+
+```rust
+use ironrdp_acceptor::{Acceptor, AcceptorResult, accept_begin, accept_finalize};
+use ironrdp_async::Framed;
+use ironrdp_tokio::TokioFramed;
+
+// Create acceptor
+let mut acceptor = Acceptor::new(
+    security_protocol,
+    desktop_size,
+    server_capabilities,
+    Some(credentials),
+);
+
+// Begin acceptance (before TLS upgrade)
+let framed = TokioFramed::new(tcp_stream);
+let begin_result = accept_begin(framed, &mut acceptor).await?;
+
+match begin_result {
+    BeginResult::ShouldUpgrade(stream) => {
+        // Perform TLS upgrade
+        let tls_stream = tls_acceptor.accept(stream).await?;
+        let framed = TokioFramed::new(tls_stream);
+        
+        // Mark upgrade complete
+        acceptor.mark_security_upgrade_as_done();
+        
+        // Continue with CredSSP if needed
+        if acceptor.should_perform_credssp() {
+            accept_credssp(
+                &mut framed,
+                &mut acceptor,
+                &mut network_client,
+                client_computer_name,
+                public_key,
+                kerberos_config,
+            ).await?;
+        }
+        
+        // Finalize connection
+        let (framed, result) = accept_finalize(framed, &mut acceptor).await?;
+        
+        // Connection established
+        handle_connection(framed, result).await?;
+    }
+    BeginResult::Continue(framed) => {
+        // No TLS upgrade needed
+        let (framed, result) = accept_finalize(framed, &mut acceptor).await?;
+        handle_connection(framed, result).await?;
+    }
+}
+```
+
+### AcceptorResult
+
+When the acceptor reaches the `Accepted` state, `get_result()` returns:
+
+```rust
+pub struct AcceptorResult {
+    pub static_channels: StaticChannelSet,
+    pub capabilities: Vec<CapabilitySet>,
+    pub input_events: Vec<Vec<u8>>,
+    pub user_channel_id: u16,
+    pub io_channel_id: u16,
+    pub reactivation: bool,
+}
+```
+
+- **static_channels**: Negotiated static virtual channels
+- **capabilities**: Client capability sets
+- **input_events**: Queued input events from finalization
+- **user_channel_id**: MCS user channel ID
+- **io_channel_id**: MCS I/O channel ID
+- **reactivation**: Whether this is a deactivation-reactivation sequence
+
+## Security Protocol Handling
+
+### No Security (RDP)
+
+```rust
+let acceptor = Acceptor::new(
+    SecurityProtocol::empty(),  // No security
+    desktop_size,
+    capabilities,
+    Some(credentials),  // Credentials in Client Info PDU
+);
+```
+
+### TLS Only
+
+```rust
+let acceptor = Acceptor::new(
+    SecurityProtocol::SSL,
+    desktop_size,
+    capabilities,
+    None,  // No CredSSP
+);
+```
+
+### Hybrid (CredSSP + TLS)
+
+```rust
+let acceptor = Acceptor::new(
+    SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX,
+    desktop_size,
+    capabilities,
+    Some(credentials),
+);
+
+// After TLS upgrade, perform CredSSP
+accept_credssp(
+    &mut framed,
+    &mut acceptor,
+    &mut network_client,
+    client_computer_name,
+    public_key,
+    kerberos_config,
+).await?;
+```
+
+## Static Virtual Channels
+
+Attach server-side channel processors before accepting connections:
+
+```rust
+use ironrdp_svc::SvcServerProcessor;
+
+struct MyChannelProcessor;
+
+impl SvcServerProcessor for MyChannelProcessor {
+    fn channel_name(&self) -> &str {
+        "MYCHANNEL"
+    }
+    
+    fn process_message(&mut self, message: &[u8]) -> Result<Vec<u8>> {
+        // Process channel data
+        Ok(response)
+    }
+}
+
+acceptor.attach_static_channel(MyChannelProcessor);
+```
+
+The acceptor will automatically match client channel requests with attached processors.
+
+## Deactivation-Reactivation
+
+Handle display resize via deactivation-reactivation:
+
+```rust
+use ironrdp_acceptor::Acceptor;
+
+// After initial connection
+let initial_result = acceptor.get_result().unwrap();
+
+// Later, to resize:
+let new_size = DesktopSize { width: 2560, height: 1440 };
+
+let mut reactivation_acceptor = Acceptor::new_deactivation_reactivation(
+    consumed_acceptor,
+    initial_result.static_channels,
+    new_size,
+)?;
+
+// Send Server Deactivate All PDU
+send_deactivate_all(framed, user_channel_id, io_channel_id).await?;
+
+// Re-run acceptance sequence
+let (framed, result) = accept_finalize(framed, &mut reactivation_acceptor).await?;
+```
+
+## CredSSP Authentication
+
+The acceptor handles CredSSP (Credential Security Support Provider) for Hybrid and Hybrid-EX:
+
+```rust
+use ironrdp_connector::sspi::{AuthIdentity, Username, KerberosServerConfig};
+
+let credentials = Credentials {
+    username: "admin".to_string(),
+    password: "password".to_string(),
+    domain: Some("CONTOSO".to_string()),
+};
+
+let kerberos_config = Some(KerberosServerConfig {
+    // Kerberos configuration
+});
+
+accept_credssp(
+    &mut framed,
+    &mut acceptor,
+    &mut network_client,
+    ServerName::new("server.contoso.com")?,
+    server_public_key,  // TLS certificate public key
+    kerberos_config,
+).await?;
+```
+
+### Authentication Result
+
+For Hybrid-EX, the acceptor automatically sends the Early User Authorization Result:
+
+- **Success** - Authentication successful
+- **AccessDenied** - Authentication failed
+
+## State Inspection
+
+### Check Current State
+
+```rust
+if acceptor.reached_security_upgrade().is_some() {
+    // Ready for TLS upgrade
+}
+
+if acceptor.should_perform_credssp() {
+    // Need to perform CredSSP
+}
+
+if let Some(result) = acceptor.get_result() {
+    // Connection established
+}
+```
+
+### State Transitions
+
+```rust
+use ironrdp_connector::{Sequence, State};
+
+let state_name = acceptor.state().name();
+let is_terminal = acceptor.state().is_terminal();
+
+if let Some(hint) = acceptor.next_pdu_hint() {
+    // Read next PDU based on hint
+    let pdu = framed.read_by_hint(hint).await?;
+}
+```
+
+## Integration with ironrdp-server
+
+The `ironrdp-acceptor` crate is typically used through [`ironrdp-server`](/api/ironrdp-server), which provides a higher-level API. However, you can use it directly for custom server implementations:
+
+```rust
+use ironrdp_acceptor::{Acceptor, accept_begin, accept_finalize};
+use ironrdp_async::single_sequence_step;
+use ironrdp_core::WriteBuf;
+
+// Manual step-by-step processing
+let mut buf = WriteBuf::new();
+
+loop {
+    // Process one step
+    single_sequence_step(&mut framed, &mut acceptor, &mut buf).await?;
+    
+    if let Some(result) = acceptor.get_result() {
+        // Connection established
+        break;
+    }
+}
+```
+
+## Error Handling
+
+The acceptor returns `ConnectorResult<T>` which maps to `ironrdp_connector::ConnectorError`:
+
+```rust
+use ironrdp_connector::{ConnectorError, ConnectorResult};
+
+match accept_finalize(framed, &mut acceptor).await {
+    Ok((framed, result)) => {
+        // Success
+    }
+    Err(ConnectorError::Reason(reason)) => {
+        // Connection failed with reason
+        eprintln!("Connection failed: {}", reason);
+    }
+    Err(e) => {
+        // Other error
+        eprintln!("Error: {}", e);
+    }
+}
+```
+
+## Advanced Features
+
+### Skip Channel Join
+
+Clients supporting `SUPPORT_SKIP_CHANNELJOIN` can skip individual channel join sequences:
+
+```rust
+// Automatically detected from client early capability flags
+// The acceptor handles this internally
+```
+
+### Monitor Layout
+
+For clients supporting `SUPPORT_MONITOR_LAYOUT_PDU`:
+
+```rust
+// The acceptor automatically sends monitor layout if supported
+// Based on desktop_size provided to Acceptor::new()
+```
+
+## Related Crates
+
+- [`ironrdp-server`](/api/ironrdp-server) - High-level server implementation
+- [`ironrdp-connector`](/api/ironrdp-connector) - Shared connection types and traits
+- [`ironrdp-pdu`](/api/ironrdp-pdu) - RDP PDU encoding/decoding
+- [`ironrdp-svc`](/api/ironrdp-svc) - Static virtual channel support
+- [`ironrdp-async`](/api/ironrdp-async) - Async helpers and framing
+
+## See Also
+
+- [ironrdp-server Example](/api/ironrdp-server#example) - Full server implementation using acceptor
+- [RDP Connection Sequence](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/023f1e69-cfe8-4ee6-9ee0-7e759fb4e4ee) - Microsoft documentation

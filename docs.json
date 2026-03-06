@@ -1,122 +1,140 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mint Starter Kit",
+  "name": "IronRDP",
+  "theme": "aspen",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#7c7c7c",
+    "light": "#101010",
+    "dark": "#cccccc"
   },
   "favicon": "/favicon.svg",
+  "logo": {
+    "light": "https://media.brand.dev/b862fc91-e8e3-4708-a8bd-6e8e9e8839c6.png",
+    "dark": "https://media.brand.dev/05180d62-584a-4016-a041-fe1b4651154f.jpg"
+  },
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/Devolutions/IronRDP"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/Devolutions/IronRDP"
+    }
+  },
   "navigation": {
     "tabs": [
       {
-        "tab": "Guides",
+        "tab": "Documentation",
         "groups": [
           {
-            "group": "Getting started",
+            "group": "Get Started",
             "pages": [
-              "index",
-              "quickstart",
-              "development"
+              "introduction",
+              "installation",
+              "quickstart"
             ]
           },
           {
-            "group": "Customization",
+            "group": "Architecture",
             "pages": [
-              "essentials/settings",
-              "essentials/navigation"
+              "architecture/overview",
+              "architecture/crate-tiers",
+              "architecture/design-principles"
             ]
           },
           {
-            "group": "Writing content",
+            "group": "Core Concepts",
             "pages": [
-              "essentials/markdown",
-              "essentials/code",
-              "essentials/images",
-              "essentials/reusable-snippets"
+              "concepts/protocol-overview",
+              "concepts/connection-flow",
+              "concepts/virtual-channels",
+              "concepts/graphics-codecs"
             ]
           },
           {
-            "group": "AI tools",
+            "group": "Guides",
             "pages": [
-              "ai-tools/cursor",
-              "ai-tools/claude-code",
-              "ai-tools/windsurf"
+              "guides/building-a-client",
+              "guides/building-a-server",
+              "guides/virtual-channels",
+              "guides/graphics-rendering",
+              "guides/async-io",
+              "guides/ffi-bindings",
+              "guides/webassembly"
             ]
           }
         ]
       },
       {
-        "tab": "API reference",
+        "tab": "API Reference",
         "groups": [
           {
-            "group": "API documentation",
+            "group": "Core Tier",
             "pages": [
-              "api-reference/introduction"
+              "api/ironrdp-core",
+              "api/ironrdp-pdu",
+              "api/ironrdp-graphics",
+              "api/ironrdp-connector",
+              "api/ironrdp-session",
+              "api/ironrdp-input",
+              "api/ironrdp-svc",
+              "api/ironrdp-dvc"
             ]
           },
           {
-            "group": "Endpoint examples",
+            "group": "Virtual Channels",
             "pages": [
-              "api-reference/endpoint/get",
-              "api-reference/endpoint/create",
-              "api-reference/endpoint/delete",
-              "api-reference/endpoint/webhook"
+              "api/ironrdp-cliprdr",
+              "api/ironrdp-rdpdr",
+              "api/ironrdp-rdpsnd",
+              "api/ironrdp-displaycontrol"
+            ]
+          },
+          {
+            "group": "I/O & Integration",
+            "pages": [
+              "api/ironrdp-blocking",
+              "api/ironrdp-async",
+              "api/ironrdp-tokio",
+              "api/ironrdp-futures",
+              "api/ironrdp-tls"
+            ]
+          },
+          {
+            "group": "Client & Server",
+            "pages": [
+              "api/ironrdp-client",
+              "api/ironrdp-acceptor",
+              "api/ironrdp-server"
+            ]
+          },
+          {
+            "group": "Specialized",
+            "pages": [
+              "api/ironrdp-web",
+              "api/ironrdp-error",
+              "api/ffi"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Resources",
+        "groups": [
+          {
+            "group": "Examples & Contributing",
+            "pages": [
+              "examples/overview",
+              "examples/screenshot",
+              "examples/server",
+              "contributing",
+              "faq"
             ]
           }
         ]
       }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
-  },
-  "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
-    "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://dashboard.mintlify.com"
-    }
-  },
-  "contextual": {
-    "options": [
-     "copy",
-     "view",
-     "chatgpt",
-     "claude",
-     "perplexity",
-     "mcp",
-     "cursor",
-     "vscode"
-   ]
-  },
-  "footer": {
-    "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
-    }
+    ]
   }
 }

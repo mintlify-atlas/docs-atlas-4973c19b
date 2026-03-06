@@ -1,0 +1,363 @@
+---
+title: Installation
+description: Add IronRDP to your Rust project with Cargo
+---
+
+IronRDP is published to [crates.io](https://crates.io/crates/ironrdp) and can be added to your Rust project using Cargo.
+
+## Prerequisites
+
+Before installing IronRDP, ensure you have:
+
+- **Rust toolchain**: Version 1.88.0 or later (as specified in `rust-toolchain.toml`)
+- **Cargo**: Rust's package manager (included with Rust)
+
+<Note>
+IronRDP uses Rust Edition 2021 and requires a modern Rust toolchain.
+</Note>
+
+## Basic Installation
+
+Add IronRDP to your `Cargo.toml`:
+
+```toml
+[dependencies]
+ironrdp = "0.14"
+```
+
+By default, this enables the `core` and `pdu` features, providing basic types and PDU encoding/decoding.
+
+## Feature-Based Installation
+
+IronRDP is designed as a meta crate with optional feature flags. Choose the features you need:
+
+### Client Development
+
+For building RDP clients:
+
+```toml
+[dependencies]
+ironrdp = { version = "0.14", features = ["connector", "session", "graphics"] }
+```
+
+**Required features:**
+- `connector` - Client connection state machines (`ironrdp-connector`)
+- `session` - Session state machines (`ironrdp-session`)
+- `graphics` - Image processing primitives (`ironrdp-graphics`)
+
+### Server Development
+
+For building RDP servers:
+
+```toml
+[dependencies]
+ironrdp = { version = "0.14", features = ["acceptor", "server"] }
+```
+
+**Required features:**
+- `acceptor` - Server connection acceptance (`ironrdp-acceptor`)
+- `server` - Server implementation skeleton (`ironrdp-server`)
+
+### Virtual Channels
+
+Add support for specific virtual channels:
+
+```toml
+[dependencies]
+ironrdp = { version = "0.14", features = [
+    "cliprdr",        # Clipboard redirection
+    "rdpdr",          # Device redirection
+    "rdpsnd",         # Audio output
+    "displaycontrol", # Display control
+    "svc",            # Static virtual channels base
+    "dvc",            # Dynamic virtual channels
+] }
+```
+
+### Complete Feature Reference
+
+<AccordionGroup>
+  <Accordion title="Core Features">
+    - `core` - Common traits and types (`ironrdp-core`) **[default]**
+    - `pdu` - PDU encoding and decoding (`ironrdp-pdu`) **[default]**
+  </Accordion>
+
+  <Accordion title="Connection & Session">
+    - `connector` - Client connection state machines (`ironrdp-connector`)
+    - `acceptor` - Server connection acceptance (`ironrdp-acceptor`)
+    - `session` - Session state machines (`ironrdp-session`)
+  </Accordion>
+
+  <Accordion title="Media & Graphics">
+    - `graphics` - Image processing primitives (`ironrdp-graphics`)
+    - `input` - Input packet utilities (`ironrdp-input`)
+    - `qoi` - QOI codec support
+    - `qoiz` - QOIZ codec support
+  </Accordion>
+
+  <Accordion title="Virtual Channels">
+    - `svc` - Static virtual channel traits (`ironrdp-svc`)
+    - `dvc` - Dynamic virtual channel implementation (`ironrdp-dvc`)
+    - `cliprdr` - Clipboard redirection (`ironrdp-cliprdr`)
+    - `rdpdr` - Device redirection (`ironrdp-rdpdr`)
+    - `rdpsnd` - Audio output (`ironrdp-rdpsnd`)
+    - `displaycontrol` - Display control channel (`ironrdp-displaycontrol`)
+    - `echo` - Echo channel (`ironrdp-echo`)
+  </Accordion>
+
+  <Accordion title="Server">
+    - `server` - Server implementation skeleton (`ironrdp-server`)
+  </Accordion>
+</AccordionGroup>
+
+## I/O Layer Installation
+
+IronRDP's core is I/O-agnostic. Choose an I/O layer based on your needs:
+
+### Blocking I/O
+
+For synchronous applications:
+
+```toml
+[dependencies]
+ironrdp = { version = "0.14", features = ["connector", "session"] }
+ironrdp-blocking = "0.8"
+```
+
+**Use case:** Simple clients, CLI tools, examples
+
+### Async I/O with Tokio
+
+For async applications using Tokio:
+
+```toml
+[dependencies]
+ironrdp = { version = "0.14", features = ["connector", "session"] }
+ironrdp-tokio = "0.5"
+tokio = { version = "1", features = ["full"] }
+```
+
+**Use case:** High-performance servers, concurrent clients
+
+### Async I/O with Futures
+
+For async applications using the Futures crate:
+
+```toml
+[dependencies]
+ironrdp = { version = "0.14", features = ["connector", "session"] }
+ironrdp-async = "0.8"
+ironrdp-futures = "0.5"
+```
+
+**Use case:** Custom async runtimes, `async-std` users
+
+## Additional Dependencies
+
+Depending on your use case, you may need:
+
+### For TLS Support
+
+```toml
+[dependencies]
+ironrdp-tls = "0.5"
+tokio-rustls = "0.26"
+```
+
+### For CredSSP Authentication
+
+```toml
+[dependencies]
+sspi = { version = "0.18", features = ["network_client"] }
+```
+
+### For Native Clipboard Support
+
+```toml
+[dependencies]
+ironrdp-cliprdr-native = "0.5"
+```
+
+### For Image Processing (Examples)
+
+```toml
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+```
+
+## Platform-Specific Considerations
+
+### No Standard Library (`no_std`)
+
+All core-tier crates are `no_std`-compatible:
+
+```toml
+[dependencies]
+ironrdp-core = { version = "0.1", default-features = false }
+ironrdp-pdu = { version = "0.7", default-features = false }
+```
+
+<Tip>
+Enable the `std` feature flag if you need standard library support:
+
+```toml
+ironrdp-pdu = { version = "0.7", default-features = false, features = ["std"] }
+```
+</Tip>
+
+### WebAssembly (WASM)
+
+For browser-based RDP clients:
+
+```toml
+[dependencies]
+ironrdp-web = "0.8"
+```
+
+**Build target:**
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo build --target wasm32-unknown-unknown
+```
+
+## Verification
+
+Verify your installation by building a minimal example:
+
+```rust
+use ironrdp::pdu::gcc::KeyboardType;
+use ironrdp::connector::{Config, Credentials, DesktopSize};
+
+fn main() {
+    let config = Config {
+        credentials: Credentials::UsernamePassword {
+            username: String::from("user"),
+            password: String::from("pass"),
+        },
+        domain: None,
+        enable_tls: true,
+        enable_credssp: true,
+        keyboard_type: KeyboardType::IbmEnhanced,
+        desktop_size: DesktopSize {
+            width: 1280,
+            height: 1024,
+        },
+        // ... other required fields with defaults
+        ..Default::default()
+    };
+
+    println!("IronRDP config created: {}x{}", 
+             config.desktop_size.width, 
+             config.desktop_size.height);
+}
+```
+
+<Note>
+The `Config` struct has many required fields. The examples above are simplified. See the [Quickstart](/quickstart) for complete configuration examples.
+</Note>
+
+## Running Examples
+
+The IronRDP repository includes runnable examples:
+
+### Screenshot Example (Client)
+
+```bash
+git clone https://github.com/Devolutions/IronRDP.git
+cd IronRDP
+cargo run --example=screenshot -- --host <HOSTNAME> -u <USERNAME> -p <PASSWORD> -o out.png
+```
+
+### Server Example
+
+```bash
+cargo run --example=server -- --bind-addr 127.0.0.1:3389 --user user --pass pass
+```
+
+### Full Client (ironrdp-client)
+
+```bash
+cargo run --bin ironrdp-client -- <HOSTNAME> --username <USERNAME> --password <PASSWORD>
+```
+
+## Type Definitions
+
+Key types you'll interact with after installation:
+
+### Connection Types
+
+```rust
+// From ironrdp::connector
+pub struct Config { /* ... */ }
+pub enum Credentials {
+    UsernamePassword { username: String, password: String },
+    SmartCard { /* ... */ },
+}
+pub struct DesktopSize {
+    pub width: u16,
+    pub height: u16,
+}
+pub struct ConnectionResult { /* ... */ }
+```
+
+### Session Types
+
+```rust
+// From ironrdp::session
+pub struct ActiveStage { /* ... */ }
+pub enum ActiveStageOutput {
+    ResponseFrame(Vec<u8>),
+    GraphicsUpdate(/* ... */),
+    Terminate(/* ... */),
+}
+```
+
+### PDU Types
+
+```rust
+// From ironrdp::pdu
+use ironrdp_pdu::rdp::client_info::CompressionType;
+use ironrdp_pdu::rdp::capability_sets::MajorPlatformType;
+```
+
+## Troubleshooting
+
+### Compilation Errors
+
+<AccordionGroup>
+  <Accordion title="Missing feature flags">
+    **Error:** `cannot find type X in module Y`
+
+    **Solution:** Enable the required feature flag:
+    ```toml
+    ironrdp = { version = "0.14", features = ["session"] }
+    ```
+  </Accordion>
+
+  <Accordion title="Version conflicts">
+    **Error:** `failed to select a version for ironrdp-*`
+
+    **Solution:** Use compatible versions across all IronRDP crates. The meta crate handles this automatically.
+  </Accordion>
+
+  <Accordion title="Minimum Rust version">
+    **Error:** Compilation fails with older Rust versions
+
+    **Solution:** Update Rust to 1.88.0 or later:
+    ```bash
+    rustup update stable
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build your first RDP client
+  </Card>
+  <Card title="API Reference" icon="code" href="https://docs.rs/ironrdp/">
+    Explore the complete API documentation
+  </Card>
+</CardGroup>

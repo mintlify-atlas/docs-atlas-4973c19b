@@ -1,0 +1,246 @@
+---
+title: ironrdp-futures
+description: futures-rs runtime integration for IronRDP async I/O
+---
+
+`ironrdp-futures` provides futures-rs runtime integration for IronRDP, implementing the framing traits from `ironrdp-async` using the `futures` crate's async I/O traits.
+
+## Overview
+
+This crate enables IronRDP to work with any executor compatible with the `futures` crate by:
+
+- Implementing `FramedRead` and `FramedWrite` for futures I/O types
+- Providing stream wrappers for different `Send` scenarios
+- Offering runtime-agnostic async I/O
+
+Use this crate when working with async-std, smol, or other executors compatible with `futures::io::AsyncRead` and `futures::io::AsyncWrite`.
+
+## Quick Start
+
+```rust
+use ironrdp_futures::FuturesFramed;
+use async_std::net::TcpStream;
+
+let stream = TcpStream::connect("rdp.example.com:3389").await?;
+let framed = FuturesFramed::new(stream);
+```
+
+## Stream Wrappers
+
+The crate provides two stream wrapper types:
+
+### FuturesStream (Send + Sync)
+
+For streams that are both `Send` and `Sync`:
+
+```rust
+use ironrdp_futures::{FuturesFramed, FuturesStream};
+
+pub type FuturesFramed<S> = Framed<FuturesStream<S>>;
+
+let framed = FuturesFramed::new(stream);
+
+// Can be sent across threads
+async_std::task::spawn(async move {
+    let (action, frame) = framed.read_pdu().await?;
+    // Process frame
+});
+```
+
+**Type bounds**: `S: Send + Sync + Unpin + AsyncRead/AsyncWrite`
+
+### LocalFuturesStream (Local)
+
+For local (non-`Send`) streams:
+
+```rust
+use ironrdp_futures::{LocalFuturesFramed, LocalFuturesStream};
+
+pub type LocalFuturesFramed<S> = Framed<LocalFuturesStream<S>>;
+
+let framed = LocalFuturesFramed::new(stream);
+
+// Use within local context (no Send bound)
+let (action, frame) = framed.read_pdu().await?;
+```
+
+**Type bounds**: `S: Unpin + AsyncRead/AsyncWrite` (no `Send` requirement)
+
+## FramedRead Implementation
+
+The `FuturesStream` implements `FramedRead` using `futures::io::AsyncReadExt`:
+
+```rust
+impl<S> FramedRead for FuturesStream<S>
+where
+    S: Send + Sync + Unpin + AsyncRead,
+{
+    fn read<'a>(&'a mut self, buf: &'a mut BytesMut) -> impl Future {
+        async {
+            let mut read_bytes = [0u8; 1024];
+            let len = self.inner.read(&mut read_bytes).await?;
+            buf.extend_from_slice(&read_bytes[..len]);
+            Ok(len)
+        }
+    }
+}
+```
+
+<Note>
+  Unlike Tokio's implementation which uses `read_buf` for zero-copy, the futures implementation reads into a fixed buffer and copies into `BytesMut`. This is slightly less efficient but compatible with the standard `AsyncRead` trait.
+</Note>
+
+## FramedWrite Implementation
+
+The `FuturesStream` implements `FramedWrite` with automatic flushing:
+
+```rust
+impl<S> FramedWrite for FuturesStream<S>
+where
+    S: Send + Sync + Unpin + AsyncWrite,
+{
+    fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> impl Future {
+        async {
+            self.inner.write_all(buf).await?;
+            self.inner.flush().await?;
+            Ok(())
+        }
+    }
+}
+```
+
+## Reading Frames
+
+All the `ironrdp-async` frame reading methods work seamlessly:
+
+```rust
+use ironrdp_futures::FuturesFramed;
+
+let mut framed = FuturesFramed::new(stream);
+
+// Read exact bytes
+let data = framed.read_exact(1024).await?;
+
+// Read PDU frames
+let (action, frame) = framed.read_pdu().await?;
+
+// Read by hint
+let bytes = framed.read_by_hint(hint).await?;
+```
+
+All read operations are **cancel safe** - partial reads are buffered internally.
+
+## Writing Frames
+
+```rust
+let pdu_bytes = /* encode your PDU */;
+framed.write_all(&pdu_bytes).await?;
+```
+
+<Warning>
+  Write operations are not cancel safe. Avoid using them in select expressions that may cancel.
+</Warning>
+
+## Connection Example with async-std
+
+```rust
+use ironrdp_futures::{FuturesFramed, connect_begin, mark_as_upgraded, connect_finalize};
+use ironrdp_connector::ClientConnector;
+use async_std::net::TcpStream;
+
+// Connect to RDP server
+let stream = TcpStream::connect("rdp.example.com:3389").await?;
+let mut framed = FuturesFramed::new(stream);
+
+// Initial connection negotiation
+let should_upgrade = connect_begin(&mut framed, &mut connector).await?;
+
+// Extract stream and perform TLS upgrade
+let (stream, leftover) = framed.into_inner();
+let tls_stream = /* upgrade to TLS */;
+
+// Continue with upgraded stream
+let mut framed = FuturesFramed::new_with_leftover(tls_stream, leftover);
+let upgraded = mark_as_upgraded(should_upgrade, &mut connector);
+
+// Finalize connection
+let result = connect_finalize(
+    upgraded,
+    connector,
+    &mut framed,
+    &mut network_client,
+    server_name,
+    server_public_key,
+    None,
+).await?;
+```
+
+## Connection Example with smol
+
+```rust
+use ironrdp_futures::FuturesFramed;
+use smol::net::TcpStream;
+
+smol::block_on(async {
+    let stream = TcpStream::connect("rdp.example.com:3389").await?;
+    let mut framed = FuturesFramed::new(stream);
+
+    // Use framed for RDP connection...
+});
+```
+
+## Performance Considerations
+
+The futures implementation has slightly different performance characteristics than Tokio:
+
+- **Buffer copying**: Reads go through an intermediate buffer (1024 bytes) before copying to `BytesMut`
+- **Portability**: Works with any `futures`-compatible runtime
+- **Simplicity**: Standard trait implementation without runtime-specific optimizations
+
+For maximum performance with Tokio specifically, use [ironrdp-tokio](/api/ironrdp-tokio) instead, which leverages Tokio's `read_buf` for zero-copy reads.
+
+## When to Use
+
+Use `ironrdp-futures` when:
+
+- Working with async-std, smol, or other non-Tokio runtimes
+- Need runtime-agnostic async code
+- Want maximum portability across executors
+- Building libraries that should work with any runtime
+
+For Tokio-specific projects, use [ironrdp-tokio](/api/ironrdp-tokio) for better performance.
+
+For blocking I/O, use [ironrdp-blocking](/api/ironrdp-blocking).
+
+## Compatible Runtimes
+
+This crate works with any runtime that supports `futures::io` traits:
+
+- **async-std**: Full-featured async runtime
+- **smol**: Lightweight async executor
+- **futures::executor**: Basic executor from futures crate
+- **custom executors**: Any executor implementing futures traits
+
+## Dependencies
+
+- **ironrdp-async**: Core async abstractions (re-exported)
+- **futures-util**: futures I/O traits and utilities
+- **bytes**: Efficient byte buffers
+
+## Re-exports
+
+This crate re-exports all of `ironrdp-async`:
+
+```rust
+pub use ironrdp_async::*;
+```
+
+You can use all async traits, types, and functions directly from `ironrdp_futures`.
+
+## Related Crates
+
+- [ironrdp-async](/api/ironrdp-async) - Core async abstractions
+- [ironrdp-tokio](/api/ironrdp-tokio) - Tokio runtime integration
+- [ironrdp-blocking](/api/ironrdp-blocking) - Blocking I/O alternative
+- [ironrdp-tls](/api/ironrdp-tls) - TLS upgrade helpers
+- [ironrdp-connector](/api/ironrdp-connector) - Connection state machines

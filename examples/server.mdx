@@ -1,0 +1,471 @@
+---
+title: Server Example
+description: Build a complete RDP server with audio and clipboard support
+---
+
+The server example demonstrates how to build a complete RDP server using the `ironrdp-server` crate. It implements a fully functional RDP server with audio output, clipboard redirection, and random graphics generation.
+
+## Overview
+
+**Location:** `crates/ironrdp/examples/server.rs`
+
+**Purpose:** Demonstrate complete RDP server implementation
+
+**Key Features:**
+- Async I/O using `tokio`
+- TLS and Hybrid (CredSSP) security modes
+- Audio streaming with OPUS encoding
+- Clipboard redirection (stub implementation)
+- Keyboard and mouse input handling
+- Random colored bitmap generation
+
+## Usage
+
+### Basic Usage (No Security)
+
+```bash
+cargo run --example server -- \
+  --bind-addr 0.0.0.0:3389 \
+  --user admin \
+  --pass secret \
+  --sec tls
+```
+
+### With TLS Certificate
+
+```bash
+cargo run --example server -- \
+  --bind-addr 0.0.0.0:3389 \
+  --cert server.crt \
+  --key server.key \
+  --user admin \
+  --pass secret \
+  --sec hybrid
+```
+
+### With Logging
+
+```bash
+IRONRDP_LOG=info cargo run --example server -- \
+  --bind-addr 127.0.0.1:3389 \
+  --user test \
+  --pass test
+```
+
+## Command-Line Arguments
+
+| Argument | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `--bind-addr` | No | 127.0.0.1:3389 | Socket address to bind to |
+| `--user` | No | "user" | Username for authentication |
+| `--pass` | No | "pass" | Password for authentication |
+| `--cert` | No | - | Path to TLS certificate file |
+| `--key` | No | - | Path to TLS private key file |
+| `--sec` | No | "hybrid" | Security mode: "tls" or "hybrid" |
+
+## Code Walkthrough
+
+### 1. Input Handler
+
+Implements keyboard and mouse event handling:
+
+```rust
+struct Handler;
+
+impl RdpServerInputHandler for Handler {
+    fn keyboard(&mut self, event: KeyboardEvent) {
+        info!(?event, "keyboard");
+    }
+    
+    fn mouse(&mut self, event: MouseEvent) {
+        info!(?event, "mouse");
+    }
+}
+```
+
+See: `server.rs:131`
+
+### 2. Display Handler
+
+Provides desktop size and generates display updates:
+
+```rust
+#[async_trait::async_trait]
+impl RdpServerDisplay for Handler {
+    async fn size(&mut self) -> DesktopSize {
+        DesktopSize {
+            width: 1920,
+            height: 1080,
+        }
+    }
+    
+    async fn updates(&mut self) -> anyhow::Result<Box<dyn RdpServerDisplayUpdates>> {
+        Ok(Box::new(DisplayUpdates {}))
+    }
+}
+```
+
+See: `server.rs:200`
+
+### 3. Display Updates
+
+Generates random colored rectangles for demonstration:
+
+```rust
+struct DisplayUpdates;
+
+#[async_trait::async_trait]
+impl RdpServerDisplayUpdates for DisplayUpdates {
+    async fn next_update(&mut self) -> anyhow::Result<Option<DisplayUpdate>> {
+        sleep(Duration::from_millis(100)).await;
+        let mut rng = rand::rng();
+        
+        // Generate random position and size
+        let y: u16 = rng.random_range(0..1080);
+        let height = NonZeroU16::new(
+            rng.random_range(1..=1080.saturating_sub(y))
+        ).expect("never zero");
+        
+        let x: u16 = rng.random_range(0..1920);
+        let width = NonZeroU16::new(
+            rng.random_range(1..=1920.saturating_sub(x))
+        ).expect("never zero");
+        
+        // Generate random colored pixels
+        let mut data = Vec::new();
+        for _ in 0..(width.get() as usize * height.get() as usize) {
+            data.push(rng.random()); // B
+            data.push(rng.random()); // G
+            data.push(rng.random()); // R
+            data.push(255);          // A
+        }
+        
+        let bitmap = BitmapUpdate {
+            x, y, width, height,
+            format: PixelFormat::BgrA32,
+            data: data.into(),
+            stride: NonZeroUsize::from(width)
+                .checked_mul(NonZeroUsize::new(4).unwrap())
+                .unwrap(),
+        };
+        
+        Ok(Some(DisplayUpdate::Bitmap(bitmap)))
+    }
+}
+```
+
+See: `server.rs:152`
+
+### 4. Clipboard Handler
+
+Stub implementation for clipboard redirection:
+
+```rust
+struct StubCliprdrServerFactory;
+
+impl CliprdrBackendFactory for StubCliprdrServerFactory {
+    fn build_cliprdr_backend(&self) -> Box<dyn CliprdrBackend> {
+        Box::new(StubCliprdrBackend::new())
+    }
+}
+
+impl ServerEventSender for StubCliprdrServerFactory {
+    fn set_sender(&mut self, _sender: UnboundedSender<ServerEvent>) {}
+}
+
+impl CliprdrServerFactory for StubCliprdrServerFactory {}
+```
+
+See: `server.rs:213`
+
+### 5. Audio Handler
+
+Generates sine wave audio and sends it to the client:
+
+```rust
+struct SndHandler {
+    inner: Arc<Mutex<Inner>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl RdpsndServerHandler for SndHandler {
+    fn get_formats(&self) -> &[AudioFormat] {
+        &[
+            AudioFormat {
+                format: WaveFormat::OPUS,
+                n_channels: 2,
+                n_samples_per_sec: 48000,
+                n_avg_bytes_per_sec: 192000,
+                n_block_align: 4,
+                bits_per_sample: 16,
+                data: None,
+            },
+            AudioFormat {
+                format: WaveFormat::PCM,
+                n_channels: 2,
+                n_samples_per_sec: 44100,
+                n_avg_bytes_per_sec: 176400,
+                n_block_align: 4,
+                bits_per_sample: 16,
+                data: None,
+            },
+        ]
+    }
+    
+    fn start(&mut self, client_format: &ClientAudioFormatPdu) -> Option<u16> {
+        let Some(nfmt) = self.choose_format(&client_format.formats) else {
+            return Some(0);
+        };
+        
+        let fmt = client_format.formats[usize::from(nfmt)].clone();
+        let mut opus_enc = /* create OPUS encoder if needed */;
+        
+        let inner = Arc::clone(&self.inner);
+        self.task = Some(tokio::spawn(async move {
+            let mut interval = time::interval(Duration::from_millis(20));
+            let mut ts = 0;
+            let mut phase = 0.0f32;
+            
+            loop {
+                interval.tick().await;
+                
+                // Generate 440 Hz sine wave
+                let wave = generate_sine_wave(
+                    fmt.n_samples_per_sec,
+                    440.0,
+                    20,
+                    &mut phase
+                );
+                
+                // Encode with OPUS if configured
+                let data = if let Some(ref mut enc) = opus_enc {
+                    enc.encode_vec(&wave, wave.len()).unwrap()
+                } else {
+                    wave.into_iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect()
+                };
+                
+                // Send to client
+                let inner = inner.lock().unwrap();
+                if let Some(sender) = inner.ev_sender.as_ref() {
+                    let _ = sender.send(ServerEvent::Rdpsnd(
+                        RdpsndServerMessage::Wave(data, ts)
+                    ));
+                }
+                
+                ts = ts.wrapping_add(100);
+            }
+        }));
+        
+        Some(nfmt)
+    }
+    
+    fn stop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+```
+
+See: `server.rs:252`
+
+### 6. Sine Wave Generation
+
+```rust
+fn generate_sine_wave(
+    sample_rate: u32,
+    frequency: f32,
+    duration_ms: u64,
+    phase: &mut f32,
+) -> Vec<i16> {
+    use core::f32::consts::PI;
+    
+    let total_samples = (u64::from(sample_rate) * duration_ms) / 1000;
+    let delta_phase = 2.0 * PI * frequency / sample_rate as f32;
+    let amplitude = 32767.0; // Max amplitude for 16-bit audio
+    
+    let mut samples = Vec::with_capacity(total_samples as usize * 2);
+    
+    for _ in 0..total_samples {
+        let sample = (*phase).sin();
+        *phase += delta_phase;
+        *phase %= 2.0 * PI; // Wrap to maintain precision
+        
+        let sample_i16 = (sample * amplitude) as i16;
+        
+        // Stereo output
+        samples.push(sample_i16);
+        samples.push(sample_i16);
+    }
+    
+    samples
+}
+```
+
+See: `server.rs:363`
+
+### 7. Server Configuration
+
+```rust
+async fn run(
+    bind_addr: SocketAddr,
+    hybrid: bool,
+    username: String,
+    password: String,
+    cert: Option<PathBuf>,
+    key: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let handler = Handler::new();
+    
+    let server_builder = RdpServer::builder()
+        .with_addr(bind_addr);
+    
+    // Configure security
+    let server_builder = if let Some((cert_path, key_path)) = cert.zip(key) {
+        let identity = TlsIdentityCtx::init_from_paths(cert_path, key_path)?;
+        let acceptor = identity.make_acceptor()?;
+        
+        if hybrid {
+            server_builder.with_hybrid(acceptor, identity.pub_key)
+        } else {
+            server_builder.with_tls(acceptor)
+        }
+    } else {
+        server_builder.with_no_security()
+    };
+    
+    // Configure handlers
+    let cliprdr = Box::new(StubCliprdrServerFactory);
+    let sound = Box::new(StubSoundServerFactory {
+        inner: Arc::new(Mutex::new(Inner { ev_sender: None })),
+    });
+    
+    let mut server = server_builder
+        .with_input_handler(handler.clone())
+        .with_display_handler(handler.clone())
+        .with_cliprdr_factory(Some(cliprdr))
+        .with_sound_factory(Some(sound))
+        .build();
+    
+    // Set credentials
+    server.set_credentials(Some(Credentials {
+        username,
+        password,
+        domain: None,
+    }));
+    
+    // Run server
+    server.run().await
+}
+```
+
+See: `server.rs:394`
+
+## Security Modes
+
+### TLS Mode
+
+Standard TLS encryption without CredSSP:
+
+```bash
+cargo run --example server -- \
+  --cert server.crt \
+  --key server.key \
+  --sec tls
+```
+
+### Hybrid Mode
+
+TLS with CredSSP for enhanced authentication:
+
+```bash
+cargo run --example server -- \
+  --cert server.crt \
+  --key server.key \
+  --sec hybrid
+```
+
+### No Security
+
+For testing only (not recommended):
+
+```bash
+cargo run --example server -- --sec tls
+```
+
+## Testing the Server
+
+### Using Microsoft Remote Desktop
+
+```bash
+# Start the server
+cargo run --example server -- --user test --pass test
+
+# Connect with mstsc (Windows)
+mstsc /v:localhost:3389
+
+# Or use xfreerdp (Linux/macOS)
+xfreerdp /v:localhost:3389 /u:test /p:test
+```
+
+### Using IronRDP Screenshot Example
+
+```bash
+# Terminal 1: Start server
+cargo run --example server -- --user test --pass test
+
+# Terminal 2: Capture screenshot
+cargo run --example screenshot -- \
+  --host localhost \
+  -u test \
+  -p test \
+  -o server_test.png
+```
+
+## Key Takeaways
+
+1. **Async Runtime**: Uses `tokio` for async I/O and task spawning
+2. **Modular Design**: Separate handlers for input, display, clipboard, and audio
+3. **Event-Driven**: Audio and display updates sent asynchronously via channels
+4. **Flexible Security**: Supports multiple security modes (none, TLS, hybrid)
+5. **Extensible**: Easy to add custom display rendering and input handling
+
+## Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────┐
+│              RDP Client                          │
+└────────────┬───────────────────────┬─────────────┘
+             │                       │
+             │ Graphics Updates      │ Input Events
+             │                       │
+┌────────────▼───────────────────────▼─────────────┐
+│           RdpServer (ironrdp-server)             │
+├──────────────────────────────────────────────────┤
+│  ┌──────────────┐  ┌────────────┐  ┌──────────┐ │
+│  │ Display      │  │   Input    │  │ Clipboard│ │
+│  │ Handler      │  │  Handler   │  │ Handler  │ │
+│  └──────────────┘  └────────────┘  └──────────┘ │
+│                                                  │
+│  ┌──────────────────────────────────────────┐   │
+│  │       Audio Handler (RDPSND)             │   │
+│  │  - Format negotiation                    │   │
+│  │  - OPUS encoding                         │   │
+│  │  - Sine wave generation                  │   │
+│  └──────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────┘
+```
+
+## Related Examples
+
+- [Screenshot Example](/examples/screenshot) - Simple RDP client for capturing screenshots
+- [Examples Overview](/examples/overview) - All available examples
+
+## Further Reading
+
+- [ironrdp-server API](/api/ironrdp-server)
+- [ironrdp-acceptor API](/api/ironrdp-acceptor)
+- [ironrdp-rdpsnd API](/api/ironrdp-rdpsnd)
+- [ironrdp-cliprdr API](/api/ironrdp-cliprdr)

@@ -1,0 +1,322 @@
+---
+title: Contributing to IronRDP
+description: Guidelines for contributing to the IronRDP project
+---
+
+Thank you for your interest in contributing to IronRDP! This guide will help you get started with contributing to the project, whether you're fixing bugs, adding features, or improving documentation.
+
+## Quick Links
+
+- **GitHub Repository**: [Devolutions/IronRDP](https://github.com/Devolutions/IronRDP)
+- **Issue Tracker**: [GitHub Issues](https://github.com/Devolutions/IronRDP/issues)
+- **Matrix Chat**: [#IronRDP:matrix.org](https://matrix.to/#/#IronRDP:matrix.org)
+- **Crates.io**: [ironrdp](https://crates.io/crates/ironrdp)
+
+## Development Workflow
+
+### 1. Set Up Your Environment
+
+```bash
+# Clone the repository
+git clone https://github.com/Devolutions/IronRDP.git
+cd IronRDP
+
+# Bootstrap development tools
+cargo xtask bootstrap -v
+```
+
+The bootstrap command installs required tools for development, including:
+- `cargo-nextest` - Faster test runner
+- `typos` - Spell checker
+- `wasm-pack` - WebAssembly tooling
+- Other project-specific tools
+
+### 2. Make Your Changes
+
+Before starting work:
+
+1. **Check existing issues** to see if your idea is already being worked on
+2. **Open an issue** for discussion if you're planning a significant change
+3. **Create a branch** from `master` for your work
+
+```bash
+git checkout -b feature/my-awesome-feature
+```
+
+### 3. Test Your Changes
+
+Run the appropriate checks locally before submitting:
+
+```bash
+# Format check
+cargo xtask check fmt -v
+
+# Lint check
+cargo xtask check lints -v
+
+# Run tests
+cargo xtask check tests -v
+
+# Spell check
+cargo xtask check typos -v
+
+# Lockfile check
+cargo xtask check locks -v
+
+# Run full CI suite
+cargo xtask ci -v
+```
+
+<Note>
+The expectation is that if `cargo xtask ci` passes locally, the CI will be green as well.
+</Note>
+
+### 4. Submit a Pull Request
+
+1. **Commit your changes** with clear, descriptive commit messages
+2. **Push to your fork** on GitHub
+3. **Open a pull request** against the `master` branch
+4. **Fill out the PR template** with details about your changes
+5. **Wait for review** from maintainers
+
+## Coding Standards
+
+IronRDP follows strict coding standards documented in [STYLE.md](https://github.com/Devolutions/IronRDP/blob/master/STYLE.md). Key conventions:
+
+### Error Messages
+
+- Lowercase, no trailing punctuation
+- Short and concise
+- Use `crate_name::Result` (e.g., `anyhow::Result`)
+
+```rust
+// GOOD
+"invalid X.509 certificate"
+
+// BAD
+"Invalid X.509 certificate."
+```
+
+### Log Messages
+
+- Capitalize first letter, no trailing period
+- Use structured tracing fields
+
+```rust
+// GOOD
+info!(%server_addr, "Looked up server address");
+
+// BAD
+info!("Looked up server address: {server_addr}");
+```
+
+### Size Constants
+
+Annotate each addend with an inline comment:
+
+```rust
+// GOOD
+const FIXED_PART_SIZE: usize = 1 /* Version */
+    + 1 /* Endianness */
+    + 2 /* CommonHeaderLength */
+    + 4 /* Filler */;
+
+// BAD
+const FIXED_PART_SIZE: usize = 1 + 1 + 2 + 4;
+```
+
+### Documentation Comments
+
+Link to specification sections using reference-style links:
+
+```rust
+// GOOD
+
+/// [2.2.3.3.8] Server Drive Query Information Request (DR_DRIVE_QUERY_INFORMATION_REQ)
+///
+/// The server issues a query information request on a redirected file system device.
+///
+/// [2.2.3.3.8]: https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpefs/e43dcd68-2980-40a9-9238-344b6cf94946
+pub struct ServerDriveQueryInformationRequest { }
+```
+
+## Architecture Guidelines
+
+Refer to [ARCHITECTURE.md](https://github.com/Devolutions/IronRDP/blob/master/ARCHITECTURE.md) for detailed architecture information.
+
+### Core Tier Invariants
+
+When working on core tier crates (`ironrdp-core`, `ironrdp-pdu`, etc.):
+
+- **No I/O operations** - Core tier must not interact with the outside world
+- **`no_std` compatible** - Must work without the standard library (opt-in via `std` feature)
+- **No platform-dependent code** - No `#[cfg(windows)]` or similar
+- **Minimal dependencies** - Avoid unnecessary dependencies
+- **No proc-macros** - Keep compile times low
+- **Must be fuzzed** - All core tier crates require fuzz targets
+
+### Testing Requirements
+
+- **Test at the boundaries** - Focus on testing public APIs
+- **No external dependencies** - Tests must be perfectly reproducible
+- **Use `expect-test`** - For snapshot testing of structured data
+- **Use `rstest`** - For fixture-based testing
+- **Use `proptest`** - For property-based testing
+
+## Project Structure
+
+Key directories:
+
+- **`crates/`** - Main Rust workspace crates
+- **`xtask/`** - Project automation (equivalent to `make`)
+- **`fuzz/`** - Fuzz targets for robustness testing
+- **`ffi/`** - Native library + .NET bindings
+- **`web-client/`** - Browser/WebAssembly client
+- **`benches/`** - Performance benchmarks
+
+## Common Tasks
+
+### Adding a New Crate
+
+1. Create the crate in `crates/`
+2. Add it to the workspace in root `Cargo.toml`
+3. Document it in `ARCHITECTURE.md`
+4. Add tests to appropriate testsuite crate
+5. Add fuzz target if it's a core tier crate
+
+### Adding a New Virtual Channel
+
+1. Create crate in `crates/ironrdp-{channel-name}/`
+2. Implement `SvcProcessor` trait (for SVC) or `DvcProcessor` (for DVC)
+3. Define PDU types in `pdu` module
+4. Add backend trait if OS-specific operations needed
+5. Document with MS-RDP specification links
+6. Add integration tests
+7. Update architecture documentation
+
+### Fixing a Bug
+
+1. **Write a failing test** that reproduces the bug
+2. **Fix the bug** with minimal changes
+3. **Verify the test passes**
+4. **Run full test suite** to ensure no regressions
+5. **Update documentation** if behavior changed
+
+## Dependency Policy
+
+<Warning>
+Do not use `[workspace.dependencies]` for anything that is not workspace-internal. This is required for `release-plz` to correctly detect dependency updates.
+</Warning>
+
+<Warning>
+`num-derive` and `num-traits` are being phased out. Do not introduce new usage of these crates.
+</Warning>
+
+## Review Process
+
+### For Contributors
+
+- Respond to reviewer feedback promptly
+- Make requested changes or explain why you disagree
+- Keep discussions focused and constructive
+- Be patient - maintainers review PRs in their spare time
+
+### For Reviewers
+
+From STYLE.md:
+
+> Our approach to "clean code" is two-fold:
+> - we avoid blocking PRs on style changes, but
+> - at the same time, the codebase is constantly refactored.
+>
+> It is explicitly OK for a reviewer to flag only some nits in the PR, and then send a follow-up cleanup PR for things which are easier to explain by example.
+
+Small cleanup PRs are encouraged and very welcomed!
+
+## Specialized Contributions
+
+### WebAssembly
+
+```bash
+# Install WASM tools
+cargo xtask wasm install -v
+
+# Check WASM builds
+cargo xtask wasm check -v
+
+# Build web client
+cargo xtask web build -v
+
+# Run web client locally
+cargo xtask web run -v
+```
+
+### Fuzzing
+
+```bash
+# Install fuzzing tools
+cargo xtask fuzz install -v
+
+# Run fuzz targets
+cargo xtask fuzz run -v <target-name>
+```
+
+### FFI / .NET Bindings
+
+```bash
+# Install FFI tools
+cargo xtask ffi install -v
+
+# Build FFI library
+cargo xtask ffi build -v
+
+# Generate bindings
+cargo xtask ffi bindings -v
+
+# Build .NET project
+cd ffi/dotnet && dotnet build
+```
+
+## Getting Help
+
+### Report Bugs
+
+Open an issue on [GitHub Issues](https://github.com/Devolutions/IronRDP/issues) with:
+
+- Clear description of the problem
+- Steps to reproduce
+- Expected vs actual behavior
+- Environment details (OS, Rust version, etc.)
+- Relevant logs or error messages
+
+### Ask Questions
+
+Join the [Matrix chat room](https://matrix.to/#/#IronRDP:matrix.org) to:
+
+- Ask questions about the codebase
+- Discuss potential features
+- Get help with contributions
+- Chat with other contributors
+
+## Community Guidelines
+
+- Be respectful and professional
+- Focus on technical merits of ideas
+- Welcome newcomers and help them get started
+- Keep discussions on-topic
+- Follow the [Rust Code of Conduct](https://www.rust-lang.org/policies/code-of-conduct)
+
+## License
+
+By contributing to IronRDP, you agree that your contributions will be licensed under the same license as the project. See the [LICENSE](https://github.com/Devolutions/IronRDP/blob/master/LICENSE) file for details.
+
+## Recognition
+
+Contributors are recognized in:
+
+- Git commit history
+- GitHub contributor graphs
+- Release notes for significant contributions
+- `CHANGELOG.md` for user-visible changes
+
+Thank you for contributing to IronRDP!

@@ -1,0 +1,289 @@
+---
+title: ironrdp-displaycontrol
+description: Display control dynamic virtual channel for resolution changes
+---
+
+The `ironrdp-displaycontrol` crate implements the Display Control Virtual Channel Extension as specified in [MS-RDPEDISP](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpedisp/). This dynamic virtual channel (DVC) enables clients to request display resolution and monitor layout changes during an active RDP session.
+
+## Overview
+
+The Display Control channel operates over the dynamic virtual channel (DVC) infrastructure and allows clients to dynamically adjust the remote desktop resolution without reconnecting. This is essential for responsive window resizing and multi-monitor configurations.
+
+## Channel Name
+
+```rust
+pub const CHANNEL_NAME: &str = "Microsoft::Windows::RDS::DisplayControl";
+```
+
+See: `ironrdp-displaycontrol/src/lib.rs:4`
+
+## Client API
+
+### DisplayControlClient
+
+The client processor for display control operations.
+
+```rust
+pub struct DisplayControlClient {
+    on_capabilities_received: OnCapabilitiesReceived,
+    ready: bool,
+}
+```
+
+See: `ironrdp-displaycontrol/src/client.rs:11`
+
+**Constructor:**
+
+```rust
+impl DisplayControlClient {
+    pub fn new<F>(callback: F) -> Self
+    where
+        F: Fn(DisplayControlCapabilities) -> PduResult<Vec<DvcMessage>> + Send + 'static
+}
+```
+
+The callback is invoked when the server sends its capabilities. The channel is not operational until capabilities are received.
+
+**Key Methods:**
+
+- `ready() -> bool` - Returns true if capabilities have been received
+- `encode_single_primary_monitor()` - Creates a monitor layout PDU for a single monitor
+
+## Core Types
+
+### DisplayControlPdu
+
+Top-level PDU enum for display control messages:
+
+```rust
+pub enum DisplayControlPdu {
+    Caps(DisplayControlCapabilities),
+    MonitorLayout(DisplayControlMonitorLayout),
+}
+```
+
+See: `ironrdp-displaycontrol/src/pdu/mod.rs:28`
+
+### DisplayControlCapabilities
+
+Server capabilities for display control:
+
+```rust
+pub struct DisplayControlCapabilities {
+    max_num_monitors: u32,
+    max_monitor_area_factor_a: u32,
+    max_monitor_area_factor_b: u32,
+    max_monitor_area: u64,
+}
+```
+
+See: `ironrdp-displaycontrol/src/pdu/mod.rs:131`
+
+**Constraints:**
+
+- `max_num_monitors` must be less than or equal to 1024
+- `max_monitor_area_factor_a` must be less than or equal to 16384
+- `max_monitor_area_factor_b` must be less than or equal to 16384
+- `max_monitor_area = max_monitor_area_factor_a * max_monitor_area_factor_b * max_num_monitors`
+
+### DisplayControlMonitorLayout
+
+Monitor layout configuration sent from client to server:
+
+```rust
+pub struct DisplayControlMonitorLayout {
+    monitors: Vec<MonitorLayoutEntry>,
+}
+```
+
+See: `ironrdp-displaycontrol/src/pdu/mod.rs:213`
+
+### MonitorLayoutEntry
+
+Individual monitor configuration:
+
+```rust
+pub struct MonitorLayoutEntry {
+    is_primary: bool,
+    left: i32,
+    top: i32,
+    width: u32,
+    height: u32,
+    physical_width: u32,
+    physical_height: u32,
+    orientation: u32,
+    desktop_scale_factor: u32,
+    device_scale_factor: u32,
+}
+```
+
+See: `ironrdp-displaycontrol/src/pdu/mod.rs:354`
+
+**Display Size Constraints:**
+
+- Width: 200 to 8192 pixels (must be even)
+- Height: 200 to 8192 pixels
+- Physical dimensions: 10 to 10,000 mm
+- Desktop scale factor: 100% to 500%
+
+## Usage Example
+
+### Basic Setup
+
+```rust
+use ironrdp::displaycontrol::client::DisplayControlClient;
+use ironrdp::displaycontrol::pdu::DisplayControlCapabilities;
+
+// Create display control client with capabilities callback
+let display_client = DisplayControlClient::new(|caps| {
+    println!("Server capabilities:");
+    println!("  Max monitors: {}", caps.max_num_monitors());
+    println!("  Max area: {}", caps.max_monitor_area());
+    Ok(Vec::new())
+});
+
+// Add to DVC processor
+dvc_processor.add_dynamic_channel(display_client);
+```
+
+### Requesting Resolution Change
+
+```rust
+use ironrdp::displaycontrol::pdu::MonitorLayoutEntry;
+
+// Wait for channel to be ready
+if !display_client.ready() {
+    return Err("Display control channel not ready");
+}
+
+// Adjust display size to valid range
+let (width, height) = MonitorLayoutEntry::adjust_display_size(1920, 1080);
+
+// Create single monitor layout
+let messages = display_client.encode_single_primary_monitor(
+    channel_id,
+    width,
+    height,
+    Some(100), // 100% scale factor
+    None,      // No physical dimensions
+)?;
+
+// Send to server
+for message in messages {
+    send_svc_message(message)?;
+}
+```
+
+### Multi-Monitor Configuration
+
+```rust
+use ironrdp::displaycontrol::pdu::{
+    DisplayControlMonitorLayout,
+    MonitorLayoutEntry,
+    MonitorOrientation,
+};
+
+// Create primary monitor
+let primary = MonitorLayoutEntry::new_primary(1920, 1080)?
+    .with_orientation(MonitorOrientation::Landscape);
+
+// Create secondary monitor
+let secondary = MonitorLayoutEntry::new_secondary(1920, 1080)?
+    .with_position(1920, 0)?  // Position to the right of primary
+    .with_orientation(MonitorOrientation::Landscape);
+
+// Build layout
+let layout = DisplayControlMonitorLayout::new(&[primary, secondary])?;
+
+// Encode and send
+let pdu: DisplayControlPdu = layout.into();
+let messages = encode_dvc_messages(channel_id, vec![Box::new(pdu)], ChannelFlags::empty())?;
+send_messages(messages)?;
+```
+
+## Monitor Orientation
+
+```rust
+pub enum MonitorOrientation {
+    Landscape,         // 0 degrees
+    Portrait,          // 90 degrees
+    LandscapeFlipped,  // 180 degrees
+    PortraitFlipped,   // 270 degrees
+}
+```
+
+See: `ironrdp-displaycontrol/src/pdu/mod.rs:656`
+
+## Device Scale Factors
+
+```rust
+pub enum DeviceScaleFactor {
+    Scale100Percent,  // 100%
+    Scale140Percent,  // 140%
+    Scale180Percent,  // 180%
+}
+```
+
+See: `ironrdp-displaycontrol/src/pdu/mod.rs:686`
+
+## Protocol Flow
+
+### Initialization
+
+1. DVC channel is established using the channel name `"Microsoft::Windows::RDS::DisplayControl"`
+2. Server sends `DisplayControlCapabilities` PDU
+3. Client callback is invoked with server capabilities
+4. Client can now send `DisplayControlMonitorLayout` PDUs
+
+### Resolution Change Request
+
+1. Client detects window resize or monitor configuration change
+2. Client adjusts dimensions to valid ranges using `adjust_display_size()`
+3. Client creates `DisplayControlMonitorLayout` with new configuration
+4. Client sends PDU to server via DVC
+5. Server applies new resolution and responds with graphics updates
+
+## Validation Helpers
+
+### adjust_display_size
+
+Adjusts width and height to be within valid ranges:
+
+```rust
+pub fn adjust_display_size(width: u32, height: u32) -> (u32, u32) {
+    let constrain = |value: u32| value.clamp(200, 8192);
+    
+    let mut width = width;
+    if width % 2 != 0 {
+        width = width.saturating_sub(1);
+    }
+    
+    (constrain(width), constrain(height))
+}
+```
+
+See: `ironrdp-displaycontrol/src/pdu/mod.rs:438`
+
+## Important Notes
+
+<Warning>
+Always use `adjust_display_size()` before creating monitor layout entries to ensure dimensions are within valid ranges. Invalid dimensions will cause encoding errors.
+</Warning>
+
+<Note>
+The primary monitor position must always be (0, 0). Attempting to position the primary monitor elsewhere will result in an error.
+</Note>
+
+<Note>
+Exactly one monitor must be marked as primary. Layouts with zero or multiple primary monitors will be rejected.
+</Note>
+
+## Related Crates
+
+- **ironrdp-dvc**: Dynamic virtual channel infrastructure and traits
+- **ironrdp-svc**: Static virtual channel base types
+- **ironrdp-pdu**: Protocol data unit encoding/decoding
+
+## References
+
+- [MS-RDPEDISP: Remote Desktop Protocol: Display Control Virtual Channel Extension](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpedisp/)

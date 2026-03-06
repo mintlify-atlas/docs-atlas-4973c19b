@@ -1,0 +1,608 @@
+---
+title: Graphics Codecs
+description: Understanding bitmap compression and graphics codecs in RDP
+---
+
+RDP supports multiple bitmap compression codecs to optimize graphics performance over varying network conditions. IronRDP implements the most widely-used codecs, prioritizing security and correctness.
+
+## Supported Codecs
+
+IronRDP supports four primary bitmap codecs:
+
+| Codec | RDP Version | Description | Compression |
+|-------|-------------|-------------|-------------|
+| **Uncompressed** | All | Raw RGB bitmap data | None |
+| **RLE** | 4.0+ | Interleaved Run-Length Encoding | Lossless |
+| **RDP 6.0** | 6.0+ | Bitmap Compression | Lossless |
+| **RemoteFX (RFX)** | 7.0+ | Advanced codec using wavelet transform | Lossy/Lossless |
+
+From `README.md:13-18`.
+
+## Codec Negotiation
+
+Codecs are negotiated during capabilities exchange via the Bitmap Capability Set.
+
+### Client Advertisement
+
+```rust
+// From ironrdp-connector
+use ironrdp_pdu::rdp::capability_sets::BitmapCodecs;
+
+let bitmap_config = BitmapConfig {
+    lossy_compression: true,
+    color_depth: 32,
+    codecs: BitmapCodecs {
+        codecs: vec![
+            Codec::RemoteFx(RemoteFxContainer { /* ... */ }),
+        ],
+    },
+};
+```
+
+The client specifies:
+- **Preferred color depth**: 15, 16, 24, or 32 bits per pixel
+- **Supported codecs**: List of codec GUIDs and capabilities
+- **Lossy compression**: Whether lossy codecs are acceptable
+
+### Server Response
+
+Server selects codecs from client's advertised list and includes them in the Demand Active PDU.
+
+```rust
+// Server's Bitmap Capability Set response
+let server_bitmaps = BitmapCapabilitySet {
+    pref_bits_per_pix: 32,
+    desktop_width: 1920,
+    desktop_height: 1080,
+    bitmap_compression: true,
+    // ...
+};
+```
+
+See `ironrdp-pdu/src/rdp/capability_sets/bitmap.rs`.
+
+## Uncompressed Bitmaps
+
+Raw bitmap data sent without compression.
+
+### Format
+
+- **Pixel Format**: RGB triplets or RGBX quadruplets
+- **Byte Order**: Platform-dependent (typically little-endian)
+- **Scanline Order**: Bottom-to-top (standard bitmap orientation)
+
+### Use Cases
+
+- Very simple images where compression overhead exceeds benefit
+- Regions smaller than ~100 pixels
+- Already-compressed image data (e.g., screenshots of compressed content)
+
+### Processing
+
+No decompression needed — directly blit to framebuffer:
+
+```rust
+fn process_uncompressed_bitmap(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    bpp: usize,
+    framebuffer: &mut [u8],
+) {
+    let bytes_per_pixel = bpp / 8;
+    let stride = width * bytes_per_pixel;
+    
+    for y in 0..height {
+        let src_offset = y * stride;
+        let dst_offset = (height - 1 - y) * stride;  // Flip Y
+        framebuffer[dst_offset..dst_offset + stride]
+            .copy_from_slice(&data[src_offset..src_offset + stride]);
+    }
+}
+```
+
+## RLE (Run-Length Encoding)
+
+Interleaved RLE provides lossless compression for bitmap data.
+
+### Algorithm
+
+RLE encodes consecutive identical pixels using run-length codes:
+
+- **Literal runs**: Verbatim pixel data (1-255 pixels)
+- **Repeat runs**: Single color repeated N times
+- **Special codes**: Background color, foreground color, mixed runs
+
+### Code Structure
+
+```rust
+// From ironrdp-graphics/src/rle.rs
+pub struct Code(u8);
+
+impl Code {
+    pub const REGULAR_BG_RUN: Self = Self(0x00);
+    pub const REGULAR_FG_RUN: Self = Self(0x01);
+    pub const DITHERED_RUN: Self = Self(0x02);
+    pub const MEGA_MEGA_BG_RUN: Self = Self(0xF0);
+    // ... more codes
+}
+```
+
+See `ironrdp-graphics/src/rle.rs` for full implementation.
+
+### Decompression
+
+```rust
+use ironrdp_graphics::rle::decompress;
+
+let decompressed = decompress(
+    compressed_data,
+    width,
+    height,
+    bytes_per_pixel,
+)?;
+```
+
+The decompressor maintains:
+- **Foreground color**: Current pen color
+- **Background color**: Current background color  
+- **Output buffer**: Reconstructed bitmap
+
+### Performance
+
+RLE excels at:
+- Text and UI elements (large solid color regions)
+- Simple graphics with few color transitions
+- Low-color-depth images
+
+RLE struggles with:
+- Photographs and gradients
+- High-frequency color changes
+- Noisy or dithered images
+
+## RDP 6.0 Bitmap Compression
+
+RDP 6.0 introduces an improved lossless codec.
+
+### Implementation
+
+Implemented in `ironrdp-graphics/src/rdp6/`:
+
+```rust
+pub mod rdp6 {
+    pub mod bitmap_stream;
+    pub mod rle;
+}
+```
+
+### Decoder
+
+```rust
+use ironrdp_graphics::rdp6::bitmap_stream::decoder::decode;
+
+let decoded = decode(
+    compressed_data,
+    output_buffer,
+    width,
+    height,
+)?;
+```
+
+See `ironrdp-graphics/src/rdp6/bitmap_stream/decoder.rs`.
+
+### Encoder
+
+IronRDP also provides an encoder for server-side implementations:
+
+```rust
+use ironrdp_graphics::rdp6::bitmap_stream::encoder::encode;
+
+let compressed = encode(
+    bitmap_data,
+    width,
+    height,
+)?;
+```
+
+See `ironrdp-graphics/src/rdp6/bitmap_stream/encoder.rs`.
+
+### Algorithm Details
+
+RDP 6.0 codec uses:
+- **Delta encoding**: Encodes differences from previous scanline
+- **Color caching**: Reuses frequently-occurring colors
+- **Advanced RLE**: Extended run-length codes
+
+### Use Cases
+
+- General-purpose lossless compression
+- Better than classic RLE for complex images
+- Still efficient for text and UI
+
+## RemoteFX (RFX)
+
+RemoteFX is RDP's advanced codec using wavelet-based compression.
+
+### Architecture
+
+RemoteFX processing pipeline:
+
+<Steps>
+
+### Color Space Conversion
+
+Convert RGB to YCbCr:
+
+```rust
+use ironrdp_graphics::color_conversion;
+
+// RGB to YUV conversion
+let yuv = color_conversion::rgb_to_ycbcr(rgb_data);
+```
+
+See `ironrdp-graphics/src/color_conversion.rs`.
+
+### Discrete Wavelet Transform (DWT)
+
+Apply 2D wavelet transform to decompose image into frequency subbands:
+
+```rust
+use ironrdp_graphics::dwt;
+
+// Encode: Forward DWT
+let mut coefficients = [0i16; 64 * 64];
+dwt::encode(input_data, &mut coefficients);
+```
+
+IronRDP uses integer-based DWT for performance and precision.
+
+See `ironrdp-graphics/src/dwt.rs`.
+
+### Quantization
+
+Reduce precision of wavelet coefficients:
+
+```rust
+use ironrdp_graphics::quantization;
+use ironrdp_pdu::codecs::rfx::Quant;
+
+// Apply quantization
+let quant = Quant { /* LL, LH, HL, HH factors */ };
+quantization::encode(&mut coefficients, &quant);
+```
+
+Quantization introduces controlled loss, trading quality for compression.
+
+See `ironrdp-graphics/src/quantization.rs`.
+
+### Subband Reconstruction
+
+Reorder coefficients for better compression:
+
+```rust
+use ironrdp_graphics::subband_reconstruction;
+
+// Encode differential values
+subband_reconstruction::encode(&mut coefficients[4032..]);
+```
+
+See `ironrdp-graphics/src/subband_reconstruction.rs`.
+
+### RLGR Entropy Encoding
+
+Compress coefficients using Run-Length Golomb-Rice (RLGR):
+
+```rust
+use ironrdp_graphics::rlgr;
+use ironrdp_pdu::codecs::rfx::EntropyAlgorithm;
+
+let compressed_len = rlgr::encode(
+    EntropyAlgorithm::Rlgr3,
+    &coefficients,
+    output_buffer,
+)?;
+```
+
+RLGR is optimized for wavelet coefficient distributions.
+
+See `ironrdp-graphics/src/rlgr.rs`.
+
+</Steps>
+
+### Complete RFX Encoding
+
+```rust
+use ironrdp_graphics::rfx_encode_component;
+use ironrdp_pdu::codecs::rfx::{Quant, EntropyAlgorithm};
+
+let mut input = [0i16; 64 * 64];  // Y, Cb, or Cr component
+let mut output = vec![0u8; 16384];
+
+let quant = Quant {
+    ll3: 6, lh3: 6, hl3: 6, hh3: 6,
+    lh2: 7, hl2: 7, hh2: 7,
+    lh1: 8, hl1: 8, hh1: 8,
+};
+
+let compressed_size = rfx_encode_component(
+    &mut input,
+    &mut output,
+    &quant,
+    EntropyAlgorithm::Rlgr3,
+)?;
+
+let compressed_data = &output[..compressed_size];
+```
+
+See `ironrdp-graphics/src/lib.rs:23-37`.
+
+### RFX Tile Structure
+
+RemoteFX divides the screen into 64×64 pixel tiles. Each tile is encoded independently:
+
+```rust
+// Pseudocode for RFX stream structure
+RFX Stream {
+    Sync PDU
+    Codec Versions PDU
+    Channels PDU
+    Context PDU
+    
+    for each frame {
+        Frame Begin PDU
+        
+        for each region {
+            Region PDU
+            
+            for each tile {
+                Tile Data (Y, Cb, Cr components)
+            }
+        }
+        
+        Frame End PDU
+    }
+}
+```
+
+See `ironrdp-pdu/src/codecs/rfx/` for PDU structures.
+
+### Quantization Factors
+
+Quantization quality is controlled by the `Quant` structure:
+
+```rust
+pub struct Quant {
+    pub ll3: u8,  // Lowest frequency (LL)
+    pub lh3: u8, pub hl3: u8, pub hh3: u8,
+    pub lh2: u8, pub hl2: u8, pub hh2: u8,
+    pub lh1: u8, pub hl1: u8, pub hh1: u8,  // Highest frequency (HH)
+}
+```
+
+Higher values = more quantization = lower quality + better compression.
+
+Typical values:
+- **Lossless**: All factors = 6
+- **High quality**: 6-8 range
+- **Medium quality**: 8-10 range
+- **Low quality**: 10-12 range
+
+### Entropy Algorithms
+
+```rust
+pub enum EntropyAlgorithm {
+    Rlgr1,  // Original RLGR
+    Rlgr3,  // Improved RLGR (default)
+}
+```
+
+RLGR3 provides better compression and is recommended.
+
+### Use Cases
+
+RemoteFX excels at:
+- **High-resolution displays**: 1920×1080 and above
+- **Complex graphics**: Photographs, video frames
+- **Acceptable quality loss**: Slight artifacts OK for performance
+- **Hardware acceleration**: GPU-accelerated encoding/decoding
+
+RemoteFX limitations:
+- Requires RDP 7.0+ (Windows 7/Server 2008 R2 or later)
+- Higher CPU cost than RLE
+- Lossy compression (though minimal at high quality settings)
+
+### Enabling RemoteFX on Server
+
+Windows Server configuration:
+
+```powershell
+# Enable 32-bit color
+Set-ItemProperty -Path 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services' `
+    -Name 'ColorDepth' -Type DWORD -Value 5
+
+# Enable RemoteFX
+Set-ItemProperty -Path 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services' `
+    -Name 'fEnableVirtualizedGraphics' -Type DWORD -Value 1
+
+# Reboot required
+Restart-Computer
+```
+
+Or via Group Policy (gpedit.msc):
+1. Computer Configuration → Administrative Templates → Windows Components → Remote Desktop Services → Remote Desktop Session Host → Remote Session Environment
+2. Enable "RemoteFX for Windows Server 2008 R2"
+3. Enable "Enable RemoteFX encoding for RemoteFX clients"
+4. Enable "Limit maximum color depth" → Set to 32-bit
+5. Reboot
+
+See `README.md:46-65`.
+
+## Additional Graphics Utilities
+
+### Image Processing
+
+Utilities for bitmap manipulation:
+
+```rust
+use ironrdp_graphics::image_processing;
+
+// Convert between pixel formats, flip, etc.
+```
+
+See `ironrdp-graphics/src/image_processing.rs`.
+
+### Rectangle Processing
+
+Optimizations for rectangular bitmap operations:
+
+```rust
+use ironrdp_graphics::rectangle_processing;
+
+// Clipping, intersection, union operations
+```
+
+See `ironrdp-graphics/src/rectangle_processing.rs`.
+
+### Pointer (Cursor) Handling
+
+```rust
+use ironrdp_graphics::pointer;
+
+// Decode RDP pointer shapes (color, monochrome)
+```
+
+See `ironrdp-graphics/src/pointer.rs`.
+
+### Differential Encoding
+
+```rust
+use ironrdp_graphics::diff;
+
+// Compute and apply delta updates
+```
+
+See `ironrdp-graphics/src/diff.rs`.
+
+## Bulk Compression (ZGFX)
+
+RDP also supports bulk compression of PDU payloads using ZGFX (not a graphics codec).
+
+### ZGFX Algorithm
+
+ZGFX is a variant of DEFLATE optimized for RDP:
+
+```rust
+use ironrdp_graphics::zgfx::ZgfxCompressor;
+
+let mut compressor = ZgfxCompressor::new();
+let compressed = compressor.compress(data)?;
+```
+
+See `ironrdp-graphics/src/zgfx/`.
+
+### Bulk vs. Bitmap Compression
+
+- **Bulk compression**: Compresses entire PDUs (any data type)
+- **Bitmap compression**: Codec-specific to bitmap data
+
+They are orthogonal — bulk compression can be applied to compressed bitmaps.
+
+### Configuration
+
+Bulk compression is negotiated separately:
+
+```rust
+let config = Config {
+    compression_type: Some(CompressionType::Rdp61),  // XCRUSH (RDP 6.1)
+    // or Some(CompressionType::Rdp6) for NCRUSH
+    // or None for no bulk compression
+    // ...
+};
+```
+
+See [Protocol Overview](/concepts/protocol-overview) for bulk compression details.
+
+## Codec Selection Strategy
+
+Choose codecs based on use case:
+
+| Scenario | Recommended Codec | Rationale |
+|----------|-------------------|----------|
+| **LAN / High Bandwidth** | Uncompressed or RDP 6.0 | Minimize CPU, maximize quality |
+| **WAN / Low Bandwidth** | RemoteFX (medium quality) | Best compression ratio |
+| **Text / UI heavy** | RLE or RDP 6.0 | Lossless, efficient for solid colors |
+| **Photography / Video** | RemoteFX (high quality) | Handles complex imagery well |
+| **Legacy clients** | RLE | Broadest compatibility |
+| **Server-side rendering** | RemoteFX + GPU acceleration | Offload CPU to GPU |
+
+## Performance Considerations
+
+<Note>
+**Optimization Tips:**
+
+- **Profile your use case**: Measure actual compression ratios and CPU usage
+- **Tune quantization**: Balance quality vs. bandwidth for RemoteFX
+- **Enable hardware acceleration**: Use GPU for RFX encoding/decoding when available
+- **Monitor network conditions**: Dynamically adjust codec quality
+- **Leverage caching**: RDP supports various caching mechanisms to reduce retransmissions
+- **Consider tile size**: 64×64 is optimal for most cases, but adjustable
+</Note>
+
+## Error Handling
+
+Codec operations return `Result` types:
+
+```rust
+pub type DecodeResult<T> = Result<T, DecodeError>;
+
+impl From<rlgr::RlgrError> for DecodeError {
+    // Codec-specific error conversion
+}
+```
+
+Handle errors gracefully:
+
+```rust
+match decompress_bitmap(data, width, height) {
+    Ok(bitmap) => render(bitmap),
+    Err(e) => {
+        warn!("Bitmap decompression failed: {}", e);
+        // Fallback: request retransmission or show placeholder
+    }
+}
+```
+
+## Testing Codecs
+
+IronRDP includes extensive codec tests:
+
+```bash
+# Run graphics crate tests
+cargo test -p ironrdp-graphics
+
+# Run RFX-specific tests
+cargo test -p ironrdp-graphics --lib rfx
+
+# Fuzz codecs for robustness
+cargo xtask fuzz run -v
+```
+
+See `crates/ironrdp-graphics/` for test fixtures.
+
+## Future Codecs
+
+RDP 10+ introduces new codecs:
+- **AVC/H.264**: Video codec support
+- **HEVC/H.265**: Next-gen video compression
+- **AV1**: Modern, royalty-free codec
+
+These are planned for future IronRDP releases.
+
+## References
+
+- **Graphics Crate**: `crates/ironrdp-graphics/`
+- **RFX PDU Structures**: `crates/ironrdp-pdu/src/codecs/rfx/`
+- **Bitmap Capability Sets**: `crates/ironrdp-pdu/src/rdp/capability_sets/bitmap.rs`
+- **MS-RDPRFX**: RemoteFX Codec specification
+- **MS-RDPEGDI**: Graphics Device Interface extension
+- **MS-RDPBCGR § 3.1.9**: Bitmap compression algorithms

@@ -1,0 +1,205 @@
+---
+title: Architecture Overview
+description: High-level architecture of IronRDP and its foundational design
+---
+
+## Introduction
+
+IronRDP is a collection of Rust crates providing an implementation of the Microsoft Remote Desktop Protocol with a focus on security, correctness, and maintainability. The architecture follows a tiered design that separates foundational protocol libraries from higher-level I/O implementations.
+
+<Note>
+  This document describes the high-level architecture of IronRDP. For detailed information about specific crates, see their individual documentation.
+</Note>
+
+## Design Philosophy
+
+The IronRDP architecture is guided by several key principles:
+
+### Separation of Concerns
+
+The codebase is organized into distinct **architectural tiers**, each with specific responsibilities and constraints. This separation ensures that:
+
+- Protocol logic remains independent of I/O implementation
+- Core libraries can be used in any environment (including `no_std`)
+- Testing and fuzzing can focus on protocol correctness without I/O complexity
+- Multiple I/O models (blocking, async, WebAssembly) can share the same core
+
+### API Boundaries
+
+Certain crates are designated as **API Boundaries** - public interfaces that external code depends on. These crates receive special attention regarding:
+
+- Stability and backward compatibility
+- Documentation quality
+- Performance characteristics
+- Breaking change policies
+
+As noted in the [rules at the boundary](https://www.tedinski.com/2018/02/06/system-boundaries.html), different standards apply at these interfaces.
+
+### Security-First Development
+
+All core protocol handling code is designed with security in mind:
+
+- **Mandatory fuzzing** for all protocol parsing code
+- **No I/O in core tier** to reduce attack surface and facilitate testing
+- **Explicit error handling** with structured error types
+- **Memory safety** through Rust's type system and strict linting
+
+## Architectural Tiers
+
+The IronRDP codebase is organized into four distinct tiers, each with specific purposes and constraints:
+
+<CardGroup cols={2}>
+  <Card title="Core Tier" icon="cube" href="/architecture/crate-tiers#core-tier">
+    Foundational libraries with strict quality standards - no I/O, must be fuzzed, `no_std`-compatible
+  </Card>
+  <Card title="Extra Tier" icon="layer-group" href="/architecture/crate-tiers#extra-tier">
+    Higher-level libraries and binaries built on the core tier with relaxed constraints
+  </Card>
+  <Card title="Internal Tier" icon="wrench" href="/architecture/crate-tiers#internal-tier">
+    Test generators, fuzzing oracles, and build tools - not published as libraries
+  </Card>
+  <Card title="Community Tier" icon="users" href="/architecture/crate-tiers#community-tier">
+    Community-maintained crates with dedicated maintainers outside the core team
+  </Card>
+</CardGroup>
+
+For detailed information about each tier and the crates within them, see the [Crate Tiers](/architecture/crate-tiers) documentation.
+
+## Key Components
+
+### Protocol Stack
+
+The protocol implementation follows a layered approach:
+
+```
+┌─────────────────────────────────────────┐
+│     Application Layer                   │
+│  (ironrdp-client, ironrdp-web)         │
+└─────────────────────────────────────────┘
+              ↓
+┌─────────────────────────────────────────┐
+│     Session Layer                       │
+│  (ironrdp-session)                     │
+│  Graphics, Channels, State Machines     │
+└─────────────────────────────────────────┘
+              ↓
+┌─────────────────────────────────────────┐
+│     Connection Layer                    │
+│  (ironrdp-connector)                   │
+│  Authentication, Negotiation            │
+└─────────────────────────────────────────┘
+              ↓
+┌─────────────────────────────────────────┐
+│     PDU Layer                           │
+│  (ironrdp-pdu, ironrdp-graphics)       │
+│  Encoding/Decoding, Data Structures     │
+└─────────────────────────────────────────┘
+              ↓
+┌─────────────────────────────────────────┐
+│     Foundation                          │
+│  (ironrdp-core, ironrdp-error)         │
+│  Common Traits, Types, Error Handling   │
+└─────────────────────────────────────────┘
+```
+
+### Virtual Channels
+
+IronRDP supports both static (SVC) and dynamic (DVC) virtual channels:
+
+- **`ironrdp-svc`**: Traits and abstractions for static virtual channels
+- **`ironrdp-dvc`**: DRDYNVC implementation and traits for dynamic channels
+- **Channel implementations**: CLIPRDR (clipboard), RDPDR (device redirection), RDPSND (audio), and more
+
+### I/O Abstractions
+
+Multiple I/O models are supported through separate crates:
+
+- **`ironrdp-blocking`**: Synchronous/blocking I/O wrapper
+- **`ironrdp-async`**: Async `Future`-based wrapper
+- **`ironrdp-tokio`** and **`ironrdp-futures`**: Runtime-specific integrations
+- **`ironrdp-web`**: WebAssembly bindings for browser environments
+
+## State Machines
+
+IronRDP uses explicit state machines to drive protocol sequences:
+
+- **Connection sequence** (`ironrdp-connector`): Handles initial handshake, security negotiation, authentication
+- **Session management** (`ironrdp-session`): Manages active RDP session state, graphics updates, input handling
+- **Server acceptance** (`ironrdp-acceptor`): Drives the server-side connection acceptance (community tier)
+
+State machines are designed to be **I/O-agnostic** - they accept input, produce output, and indicate what I/O operations are required, but never perform I/O themselves.
+
+## Cross-Cutting Concerns
+
+### Dependency Injection
+
+Core tier crates never make system calls directly. Runtime information (like hostname, current time) must be injected by the caller. This enables:
+
+- Testing without mocking system APIs
+- Use in embedded or `no_std` environments
+- Deterministic behavior for fuzzing
+
+### Error Handling
+
+IronRDP uses structured error types throughout:
+
+- Libraries use concrete error types (hand-crafted or using `thiserror`)
+- The `ironrdp-error` crate provides lightweight `Error` and `Report` types
+- Error messages follow [consistent formatting conventions](/reference/style-guide#error-handling)
+
+### Testing Strategy
+
+Testing focuses on **API boundaries** rather than implementation details:
+
+- **`ironrdp-testsuite-core`**: Integration tests for core tier crates
+- **`ironrdp-testsuite-extra`**: Integration tests for extra tier crates
+- **Fuzzing**: All core tier crates must have fuzz targets
+- **Property testing**: Using `proptest` for generalized test cases
+- **Snapshot testing**: Using `expect-test` for structured data comparison
+
+### Build and CI
+
+The project uses **`cargo xtask`** for automation:
+
+```bash
+# Run full CI suite locally
+cargo xtask ci
+
+# Run specific checks
+cargo xtask check fmt
+cargo xtask check lints
+cargo xtask check tests
+```
+
+<Info>
+  **Architecture Invariant**: `cargo xtask ci` and the CI workflow must be logically equivalent. A successful local run should imply a successful CI run.
+</Info>
+
+## Performance Considerations
+
+### Compilation Time
+
+The architecture prioritizes reasonable compilation times:
+
+- **No proc-macro dependencies in core tier** - reduces compilation bottlenecks
+- **Minimal monomorphization** - generic code uses `&dyn` implementations to avoid code bloat
+- **Careful dependency management** - only essential dependencies in foundational crates
+
+### Runtime Performance
+
+While security and correctness are primary concerns, performance is not neglected:
+
+- Zero-copy parsing where possible using `ReadCursor` and `WriteCursor`
+- Allocation avoidance in hot paths
+- `no_std` support enables embedded use cases
+
+## Further Reading
+
+<CardGroup cols={2}>
+  <Card title="Crate Tiers" icon="layer-group" href="/architecture/crate-tiers">
+    Detailed breakdown of each architectural tier and its crates
+  </Card>
+  <Card title="Design Principles" icon="compass" href="/architecture/design-principles">
+    In-depth explanation of architectural invariants and design decisions
+  </Card>
+</CardGroup>

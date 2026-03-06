@@ -1,0 +1,349 @@
+---
+title: ironrdp-session
+description: State machines to drive an RDP session
+---
+
+<Note>
+**Version:** 0.8.0  
+**Docs.rs:** [ironrdp-session](https://docs.rs/ironrdp-session/latest/ironrdp_session/)
+</Note>
+
+## Overview
+
+The `ironrdp-session` crate provides state machines for managing an active RDP session after the connection is established. It handles:
+
+- Fast-path and X.224 PDU processing
+- Graphics output (bitmaps, surface commands, RemoteFX)
+- Pointer (cursor) updates
+- Graceful disconnection
+- Bulk data decompression
+
+Like `ironrdp-connector`, this crate is **transport-agnostic** and operates on byte buffers.
+
+## Core Types
+
+### ActiveStage
+
+```rust
+pub struct ActiveStage { /* ... */ }
+
+impl ActiveStage {
+    pub fn new(
+        user_channel_id: u16,
+        io_channel_id: u16,
+        no_server_pointer: bool,
+        pointer_software_rendering: bool,
+        desktop_size: DesktopSize,
+    ) -> Self;
+    
+    pub fn process(
+        &mut self,
+        image: &mut dyn image::DecodedImage,
+        payload: &[u8],
+        output_buf: &mut WriteBuf,
+    ) -> SessionResult<ActiveStageOutput>;
+}
+```
+
+**Parameters:**
+
+<ParamField path="user_channel_id" type="u16">
+MCS user channel ID from connection result
+</ParamField>
+
+<ParamField path="io_channel_id" type="u16">
+MCS I/O channel ID from connection result
+</ParamField>
+
+<ParamField path="no_server_pointer" type="bool">
+If true, render pointer locally instead of using server-provided cursor
+</ParamField>
+
+<ParamField path="pointer_software_rendering" type="bool">
+Use software rendering for pointer updates
+</ParamField>
+
+<ParamField path="desktop_size" type="DesktopSize">
+Initial desktop dimensions
+</ParamField>
+
+### ActiveStageOutput
+
+```rust
+pub enum ActiveStageOutput {
+    GraphicsUpdate,
+    PointerDefault,
+    PointerHidden,
+    PointerPosition { x: u16, y: u16 },
+    PointerBitmap { /* ... */ },
+    Terminate(GracefulDisconnectReason),
+}
+```
+
+Output events from processing a PDU.
+
+**Variants:**
+
+<ParamField path="GraphicsUpdate" type="variant">
+Graphics data was decoded into the `DecodedImage`
+</ParamField>
+
+<ParamField path="PointerDefault" type="variant">
+Use the default system pointer
+</ParamField>
+
+<ParamField path="PointerHidden" type="variant">
+Hide the pointer
+</ParamField>
+
+<ParamField path="PointerPosition" type="variant">
+Move pointer to (x, y)
+</ParamField>
+
+<ParamField path="PointerBitmap" type="variant">
+Update pointer to a custom bitmap
+</ParamField>
+
+<ParamField path="Terminate" type="variant">
+Server requested graceful disconnection
+</ParamField>
+
+### GracefulDisconnectReason
+
+```rust
+pub enum GracefulDisconnectReason {
+    UserInitiated,
+    ServerInitiated,
+    // ... other reasons
+}
+```
+
+## Image Handling
+
+### DecodedImage Trait
+
+```rust
+pub trait DecodedImage {
+    fn width(&self) -> usize;
+    fn height(&self) -> usize;
+    
+    fn from_bitmap(&mut self, region: &BitmapRegion<'_>) -> SessionResult<()>;
+    fn read_to_buffer(&self, buffer: &mut [u8]) -> SessionResult<()>;
+}
+```
+
+Implement this trait to receive decoded graphics updates.
+
+**Example Implementation:**
+
+```rust
+use ironrdp_session::image::{DecodedImage, BitmapRegion};
+use ironrdp_session::SessionResult;
+
+struct MyImage {
+    width: usize,
+    height: usize,
+    data: Vec<u8>, // BGRA format
+}
+
+impl DecodedImage for MyImage {
+    fn width(&self) -> usize { self.width }
+    fn height(&self) -> usize { self.height }
+    
+    fn from_bitmap(&mut self, region: &BitmapRegion<'_>) -> SessionResult<()> {
+        // Decode bitmap data into self.data at the specified region
+        // region.left, region.top, region.width, region.height
+        // region.pixel_format, region.pixel_data
+        Ok(())
+    }
+    
+    fn read_to_buffer(&self, buffer: &mut [u8]) -> SessionResult<()> {
+        buffer.copy_from_slice(&self.data);
+        Ok(())
+    }
+}
+```
+
+### BitmapRegion
+
+```rust
+pub struct BitmapRegion<'a> {
+    pub left: usize,
+    pub top: usize,
+    pub width: usize,
+    pub height: usize,
+    pub pixel_format: PixelFormat,
+    pub pixel_data: &'a [u8],
+}
+```
+
+## PDU Processing Modules
+
+### Fast-Path
+
+```rust
+pub mod fast_path;
+```
+
+Processes fast-path output PDUs (most graphics updates).
+
+### X.224
+
+```rust
+pub mod x224;
+```
+
+Processes X.224-framed PDUs (licensing, capability sets).
+
+### Legacy
+
+```rust
+pub mod legacy;
+```
+
+Handles legacy graphics orders.
+
+### Pointer
+
+```rust
+pub mod pointer;
+```
+
+Pointer/cursor update processing.
+
+### RemoteFX
+
+```rust
+pub mod rfx;
+```
+
+RemoteFX tile decoding.
+
+## Usage Example
+
+```rust
+use ironrdp_session::{ActiveStage, ActiveStageOutput};
+use ironrdp_connector::{ConnectionResult, DesktopSize};
+use ironrdp_core::WriteBuf;
+
+// After connection is established
+let result: ConnectionResult = /* ... */;
+
+let mut session = ActiveStage::new(
+    result.user_channel_id,
+    result.io_channel_id,
+    result.no_server_pointer,
+    result.pointer_software_rendering,
+    result.desktop_size,
+);
+
+let mut image = MyImage::new(result.desktop_size.width, result.desktop_size.height);
+let mut output = WriteBuf::new();
+
+loop {
+    // ... receive PDU data into input_buf
+    
+    match session.process(&mut image, &input_buf, &mut output)? {
+        ActiveStageOutput::GraphicsUpdate => {
+            // Image was updated, render it
+            render_frame(&image);
+        },
+        ActiveStageOutput::PointerPosition { x, y } => {
+            // Move cursor to (x, y)
+        },
+        ActiveStageOutput::Terminate(reason) => {
+            println!("Session terminated: {:?}", reason);
+            break;
+        },
+        _ => {}
+    }
+    
+    // Send any output PDUs
+    if !output.filled().is_empty() {
+        // ... send output.filled() over network
+        output.clear();
+    }
+}
+```
+
+## Error Handling
+
+```rust
+pub type SessionResult<T> = Result<T, SessionError>;
+pub type SessionError = ironrdp_error::Error<SessionErrorKind>;
+
+#[non_exhaustive]
+pub enum SessionErrorKind {
+    Pdu(ironrdp_pdu::PduError),
+    Encode(ironrdp_core::EncodeError),
+    Decode(ironrdp_core::DecodeError),
+    Reason(String),
+    General,
+    Custom,
+}
+```
+
+## Bulk Compression
+
+The session automatically handles bulk decompression when the server sends compressed PDUs:
+
+- MPPC (8 KB or 64 KB history)
+- NCRUSH (RDP 6.0)
+- XCRUSH (RDP 6.1)
+
+Compression is negotiated during connection via `Config::compression_type` in `ironrdp-connector`.
+
+## Features
+
+<ParamField path="qoi" type="feature">
+Enable QOI image codec support
+</ParamField>
+
+<ParamField path="qoiz" type="feature">
+Enable QOI + Zstd compressed image support (requires `qoi`)
+</ParamField>
+
+## Dependencies
+
+- `ironrdp-core` - Core traits (public)
+- `ironrdp-pdu` - PDU structures (public)
+- `ironrdp-graphics` - Image processing (public)
+- `ironrdp-connector` - Connection result types (public)
+- `ironrdp-svc` - Virtual channel support (public)
+- `ironrdp-dvc` - Dynamic virtual channels (public)
+- `ironrdp-bulk` - Bulk decompression
+- `ironrdp-displaycontrol` - Display control channel
+
+## Usage Notes
+
+<Note>
+**Image Ownership:**  
+The `DecodedImage` is owned by the caller. The session decodes graphics updates directly into your image buffer, avoiding unnecessary copies.
+</Note>
+
+<Note>
+**PDU Framing:**  
+The session expects complete PDUs (after TPKT/X.224/MCS unwrapping). Use `ironrdp_pdu::find_size()` to detect PDU boundaries in your framing layer.
+</Note>
+
+<Note>
+**Output Buffer:**  
+Reuse the `WriteBuf` across calls:
+
+```rust
+let mut output = WriteBuf::new();
+loop {
+    session.process(&mut image, input, &mut output)?;
+    // ... send output.filled()
+    output.clear(); // Reuse buffer
+}
+```
+</Note>
+
+## See Also
+
+- [ironrdp-connector](/api/ironrdp-connector) - Connection establishment
+- [ironrdp-graphics](/api/ironrdp-graphics) - Graphics primitives
+- [ironrdp-input](/api/ironrdp-input) - Input event generation
+- [ironrdp-pdu](/api/ironrdp-pdu) - PDU structures
+- [Session Guide](/guides/active-session) - High-level session management

@@ -1,0 +1,179 @@
+---
+title: Introduction
+description: A collection of Rust crates providing a secure, high-performance implementation of the Microsoft Remote Desktop Protocol
+---
+
+IronRDP is a collection of Rust crates that provide a complete implementation of the Microsoft Remote Desktop Protocol (RDP), with a strong focus on security and modern Rust practices.
+
+## What is IronRDP?
+
+IronRDP is a comprehensive RDP protocol implementation that enables you to:
+
+- Build custom RDP clients and servers in Rust
+- Integrate RDP functionality into existing applications
+- Create specialized remote desktop solutions with full protocol control
+- Leverage Rust's memory safety guarantees for secure remote access
+
+The project is designed as a suite of modular crates, allowing you to use only the components you need, from low-level PDU encoding/decoding to high-level client and server implementations.
+
+## Key Features
+
+### Security-First Design
+
+IronRDP treats all parsing and state transitions as potentially hostile input surfaces, making security a core architectural principle rather than an afterthought.
+
+### Modular Architecture
+
+The crate suite is organized into distinct tiers:
+
+- **Core Tier**: Foundational libraries with strict quality standards (`no_std`-compatible, heavily fuzzed)
+- **Extra Tier**: Higher-level abstractions for async/sync I/O, clients, and servers
+- **Community Tier**: Additional implementations and tools maintained by the community
+
+### Comprehensive Codec Support
+
+IronRDP supports multiple video codecs for efficient remote desktop streaming:
+
+- Uncompressed raw bitmap
+- Interleaved Run-Length Encoding (RLE) Bitmap Codec
+- RDP 6.0 Bitmap Compression
+- Microsoft RemoteFX (RFX)
+
+### Virtual Channel Support
+
+Implement custom functionality through static and dynamic virtual channels:
+
+- **CLIPRDR**: Clipboard redirection (MS-RDPECLIP)
+- **RDPDR**: Device redirection
+- **RDPSND**: Audio output (MS-RDPEA)
+- **DRDYNVC**: Dynamic virtual channel infrastructure
+- Custom channel implementations through extensible traits
+
+## Architecture Overview
+
+<Note>
+IronRDP follows a strict architectural design where foundational crates in the Core Tier must be `no_std`-compatible, platform-independent, and thoroughly fuzzed for robustness.
+</Note>
+
+The meta crate `ironrdp` re-exports the most important crates through feature flags:
+
+```toml
+[dependencies]
+ironrdp = { version = "0.14", features = ["connector", "session", "graphics"] }
+```
+
+Available features include:
+
+- `core` - Common traits and types (enabled by default)
+- `pdu` - PDU encoding and decoding (enabled by default)
+- `connector` - Client connection state machines
+- `acceptor` - Server connection acceptance
+- `session` - Session state machines
+- `graphics` - Image processing primitives
+- `server` - Server implementation skeleton
+- `cliprdr`, `rdpdr`, `rdpsnd` - Virtual channel implementations
+- And more specialized features for specific use cases
+
+## Common Use Cases
+
+### Building an RDP Client
+
+IronRDP provides everything needed to create a full-featured RDP client:
+
+```rust
+use ironrdp::connector::{self, Credentials, ConnectionResult};
+use ironrdp::session::{ActiveStage, ActiveStageOutput};
+
+let config = connector::Config {
+    credentials: Credentials::UsernamePassword { 
+        username: "user".to_owned(), 
+        password: "pass".to_owned() 
+    },
+    domain: None,
+    desktop_size: connector::DesktopSize {
+        width: 1280,
+        height: 1024,
+    },
+    // ... additional configuration
+};
+```
+
+### Building an RDP Server
+
+Create custom RDP servers with full control over input handling and display updates:
+
+```rust
+use ironrdp::server::{RdpServer, RdpServerInputHandler, KeyboardEvent, MouseEvent};
+
+struct MyHandler;
+
+impl RdpServerInputHandler for MyHandler {
+    fn keyboard(&mut self, event: KeyboardEvent) {
+        // Handle keyboard input
+    }
+
+    fn mouse(&mut self, event: MouseEvent) {
+        // Handle mouse input
+    }
+}
+```
+
+### Blocking vs Async I/O
+
+IronRDP supports both blocking and async I/O patterns:
+
+- **`ironrdp-blocking`**: Synchronous, blocking I/O for simple use cases
+- **`ironrdp-async`**: Future-based async abstractions
+- **`ironrdp-tokio`**: Integration with the Tokio async runtime
+- **`ironrdp-futures`**: Integration with the Futures crate
+
+## Example: Screenshot Client
+
+The project includes a complete example that connects to an RDP server, receives graphics updates, and saves them as a PNG image:
+
+```bash
+cargo run --example=screenshot -- --host <HOSTNAME> -u <USERNAME> -p <PASSWORD> -o out.png
+```
+
+This example demonstrates how to create a basic RDP client in just a few hundred lines of code by leveraging the IronRDP crates suite.
+
+## Example: RDP Server
+
+A full server implementation example is also included:
+
+```bash
+cargo run --example=server -- --bind-addr 127.0.0.1:3389 --user username --pass password
+```
+
+## Protocol Compliance
+
+IronRDP implements the Microsoft RDP protocol specifications, with extensive support for:
+
+- RDP 6.0+ features
+- TLS security layer
+- CredSSP authentication
+- Multiple compression types (K8, K64, RDP6, RDP6.1)
+- Virtual channel extensibility
+
+<Tip>
+For detailed protocol implementation details, see the [Microsoft Open Specifications](https://learn.microsoft.com/en-us/openspecs/windows_protocols/) (MS-RDP* series).
+</Tip>
+
+## Getting Help
+
+If you need assistance or want to contribute:
+
+- Report bugs in the [GitHub issue tracker](https://github.com/Devolutions/IronRDP/issues)
+- Join discussions in the [Matrix room](https://matrix.to/#/#IronRDP:matrix.org)
+- Review the [ARCHITECTURE.md](https://github.com/Devolutions/IronRDP/blob/master/ARCHITECTURE.md) document for deep dives
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Add IronRDP to your Rust project
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build your first RDP client in minutes
+  </Card>
+</CardGroup>

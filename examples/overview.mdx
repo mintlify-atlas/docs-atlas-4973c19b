@@ -1,0 +1,168 @@
+---
+title: Examples Overview
+description: Comprehensive guide to IronRDP example programs
+---
+
+IronRDP includes several example programs demonstrating different use cases and implementation patterns. These examples are located in `crates/ironrdp/examples/` and showcase both client and server implementations.
+
+## Available Examples
+
+### Screenshot Example
+
+**File:** `crates/ironrdp/examples/screenshot.rs`
+
+A blocking, synchronous RDP client that connects to a server, captures the remote desktop display, and saves it as a PNG image file.
+
+**Features:**
+- Demonstrates basic RDP client implementation in under 500 lines
+- Uses blocking I/O with `ironrdp-blocking` crate
+- Shows TLS upgrade process with custom certificate verification
+- Handles graphics updates and image decoding
+- Supports compression configuration
+
+**Use Cases:**
+- Automated screenshot capture for monitoring
+- Testing RDP server implementations
+- Learning basic IronRDP client structure
+
+[See detailed guide →](/examples/screenshot)
+
+### Server Example
+
+**File:** `crates/ironrdp/examples/server.rs`
+
+A complete RDP server implementation using the `ironrdp-server` crate with support for audio output and clipboard redirection.
+
+**Features:**
+- Demonstrates RDP server implementation using `ironrdp-server`
+- Implements audio streaming with OPUS encoding
+- Supports clipboard redirection (stub implementation)
+- Shows TLS/Hybrid security configuration
+- Generates random colored bitmap updates for display
+- Handles keyboard and mouse input events
+
+**Use Cases:**
+- Building custom RDP servers
+- Remote application access
+- Virtual desktop infrastructure (VDI)
+- Testing RDP client implementations
+
+[See detailed guide →](/examples/server)
+
+## Example Structure
+
+All examples follow a similar structure:
+
+1. **Argument Parsing**: Using `pico_args` for simple CLI argument handling
+2. **Logging Setup**: Tracing subscriber with `IRONRDP_LOG` environment variable
+3. **Configuration**: Building connector or server configuration
+4. **Connection/Accept**: Establishing the RDP connection
+5. **Active Stage**: Processing RDP protocol messages
+6. **Cleanup**: Proper resource cleanup and error handling
+
+## Common Patterns
+
+### Error Handling
+
+All examples use `anyhow::Result` for convenient error handling:
+
+```rust
+fn main() -> anyhow::Result<()> {
+    let config = parse_args()?;
+    setup_logging()?;
+    run(config)
+}
+```
+
+### Logging Configuration
+
+Examples use the `IRONRDP_LOG` environment variable for log filtering:
+
+```bash
+# Show all IronRDP logs
+IRONRDP_LOG=debug cargo run --example screenshot -- --host example.com -u user -p pass
+
+# Filter specific modules
+IRONRDP_LOG=ironrdp_connector=trace cargo run --example server
+```
+
+### TLS Configuration
+
+Custom certificate verification for testing:
+
+```rust
+let mut config = rustls::client::ClientConfig::builder()
+    .dangerous()
+    .with_custom_certificate_verifier(std::sync::Arc::new(NoCertificateVerification))
+    .with_no_client_auth();
+
+// Enable SSLKEYLOGFILE for Wireshark debugging
+config.key_log = std::sync::Arc::new(rustls::KeyLogFile::new());
+
+// Disable TLS resumption (required for CredSSP)
+config.resumption = rustls::client::Resumption::disabled();
+```
+
+## Building Examples
+
+### Build All Examples
+
+```bash
+cargo build --examples
+```
+
+### Build Specific Example
+
+```bash
+cargo build --example screenshot
+cargo build --example server
+```
+
+### Run with Logging
+
+```bash
+IRONRDP_LOG=info cargo run --example screenshot -- --host 10.0.0.100 -u Administrator -p MyPassword
+```
+
+## Platform Support
+
+Examples are cross-platform and detect the current platform for reporting:
+
+```rust
+#[cfg(windows)]
+platform: MajorPlatformType::WINDOWS,
+#[cfg(target_os = "macos")]
+platform: MajorPlatformType::MACINTOSH,
+#[cfg(target_os = "linux")]
+platform: MajorPlatformType::UNIX,
+```
+
+## Dependencies
+
+Common dependencies across examples:
+
+- **ironrdp**: Core RDP protocol implementation
+- **ironrdp-blocking**: Blocking I/O abstractions
+- **anyhow**: Error handling
+- **tokio-rustls**: TLS support
+- **tracing**: Structured logging
+- **pico_args**: Argument parsing
+- **image**: Image encoding (screenshot example)
+- **rand**: Random number generation (server example)
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Screenshot Example" icon="camera" href="/examples/screenshot">
+    Learn how to build a simple RDP client that captures screenshots
+  </Card>
+  <Card title="Server Example" icon="server" href="/examples/server">
+    Build a complete RDP server with audio and clipboard support
+  </Card>
+</CardGroup>
+
+## Additional Resources
+
+- [API Reference](/api/overview)
+- [Getting Started](/getting-started)
+- [Architecture Guide](/architecture)

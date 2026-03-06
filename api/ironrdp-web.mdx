@@ -1,0 +1,403 @@
+---
+title: 'ironrdp-web'
+description: 'WebAssembly bindings for IronRDP in web browsers'
+---
+
+# ironrdp-web
+
+WebAssembly high-level bindings for IronRDP targeting web browsers. This crate provides a complete RDP client implementation that runs in the browser using WebAssembly and WebSockets.
+
+## Overview
+
+The `ironrdp-web` crate exposes IronRDP functionality to JavaScript/TypeScript through WebAssembly bindings. It handles RDP protocol communication over WebSocket connections and provides APIs for session management, input handling, clipboard operations, and canvas rendering.
+
+**Source**: `crates/ironrdp-web/`
+
+## Features
+
+- **Session Management**: Full RDP session lifecycle with connection, rendering, and termination
+- **Input Handling**: Mouse, keyboard, and touch input support
+- **Clipboard Integration**: Bidirectional clipboard with format conversion (text, HTML, images)
+- **Canvas Rendering**: Direct rendering to HTML5 Canvas elements
+- **Display Control**: Dynamic resolution changes via RDP Display Control channel
+- **CredSSP Authentication**: Support for Network Level Authentication
+- **WebSocket Transport**: RDP over WebSocket with optional message size limits
+
+## Building
+
+Build the WebAssembly module using `wasm-pack`:
+
+```bash
+wasm-pack build
+```
+
+Or use the project automation tool:
+
+```bash
+cargo xtask wasm check
+cargo xtask wasm build
+```
+
+## Session Builder API
+
+### SessionBuilder
+
+Builder for configuring and establishing RDP sessions.
+
+#### Configuration Methods
+
+##### Required Parameters
+
+```typescript
+// Username for RDP authentication
+username(username: string): SessionBuilder
+
+// Destination server address
+destination(destination: string): SessionBuilder
+
+// User password
+password(password: string): SessionBuilder
+
+// WebSocket proxy address
+proxy_address(address: string): SessionBuilder
+
+// Authentication token for proxy
+auth_token(token: string): SessionBuilder
+
+// HTML canvas element for rendering
+render_canvas(canvas: HTMLCanvasElement): SessionBuilder
+
+// Cursor style change callback
+set_cursor_style_callback(callback: Function): SessionBuilder
+
+// Callback context (usually `this`)
+set_cursor_style_callback_context(context: any): SessionBuilder
+```
+
+##### Optional Parameters
+
+```typescript
+// Server domain (Active Directory domain)
+server_domain(domain: string): SessionBuilder
+
+// Desktop dimensions (default: 1280x720)
+desktop_size(size: DesktopSize): SessionBuilder
+
+// Remote clipboard change notification
+remote_clipboard_changed_callback(callback: Function): SessionBuilder
+
+// Force clipboard update request
+force_clipboard_update_callback(callback: Function): SessionBuilder
+
+// Canvas resize notification (unused in RDP)
+canvas_resized_callback(callback: Function): SessionBuilder
+```
+
+##### Extensions
+
+```typescript
+// Configure optional features
+extension(ext: Extension): SessionBuilder
+```
+
+Supported extensions:
+- `pcb`: Pre-Connection Blob for load balancing
+- `kdc_proxy_url`: Kerberos KDC proxy URL for authentication
+- `display_control`: Enable dynamic resolution changes
+- `enable_credssp`: Toggle CredSSP/NLA (default: true)
+- `outbound_message_size_limit`: Maximum outbound message size in bytes
+
+#### Connection
+
+```typescript
+// Establish the RDP connection
+async connect(): Promise<Session>
+```
+
+Performs the full RDP connection sequence:
+1. Opens WebSocket to proxy
+2. Performs RDCleanPath handshake (if applicable)
+3. Negotiates RDP protocol (X.224, MCS, RDP)
+4. Authenticates user (NLA/CredSSP if enabled)
+5. Establishes RDP session channels
+6. Returns active Session object
+
+## Session API
+
+### Session
+
+Represents an active RDP session.
+
+#### Methods
+
+```typescript
+// Start the session event loop (call once)
+async run(): Promise<SessionTerminationInfo>
+
+// Get desktop dimensions
+desktop_size(): DesktopSize
+
+// Apply buffered input events
+apply_inputs(transaction: InputTransaction): void
+
+// Release all pressed keys/buttons
+release_all_inputs(): void
+
+// Synchronize keyboard lock key states
+synchronize_lock_keys(
+  scroll_lock: boolean,
+  num_lock: boolean, 
+  caps_lock: boolean,
+  kana_lock: boolean
+): void
+
+// Initiate graceful session termination
+shutdown(): void
+
+// Send local clipboard data to remote
+async on_clipboard_paste(content: ClipboardData): Promise<void>
+
+// Request desktop resize (requires Display Control)
+resize(
+  width: number,
+  height: number,
+  scale_factor?: number,
+  physical_width?: number,
+  physical_height?: number
+): void
+
+// Check if Unicode shortcuts are supported (false for RDP)
+supports_unicode_keyboard_shortcuts(): boolean
+```
+
+## Input Handling
+
+### DeviceEvent
+
+Input events from user interaction.
+
+#### Factory Methods
+
+```typescript
+// Mouse button events
+DeviceEvent.mouse_button_pressed(button: number): DeviceEvent
+DeviceEvent.mouse_button_released(button: number): DeviceEvent
+
+// Mouse movement
+DeviceEvent.mouse_move(x: number, y: number): DeviceEvent
+
+// Mouse wheel scrolling
+DeviceEvent.wheel_rotations(
+  vertical: boolean,
+  rotation_amount: number,
+  rotation_unit: RotationUnit
+): DeviceEvent
+
+// Keyboard scancode events
+DeviceEvent.key_pressed(scancode: number): DeviceEvent
+DeviceEvent.key_released(scancode: number): DeviceEvent
+
+// Unicode keyboard events
+DeviceEvent.unicode_pressed(char: string): DeviceEvent
+DeviceEvent.unicode_released(char: string): DeviceEvent
+```
+
+#### Mouse Buttons
+
+- `0`: Left button
+- `1`: Middle button
+- `2`: Right button
+- `3-4`: Additional buttons
+
+#### Rotation Units
+
+- `RotationUnit.Pixel`: Raw pixel deltas
+- `RotationUnit.Line`: Line-based scrolling (× 50 pixels)
+- `RotationUnit.Page`: Page-based scrolling (× 38 lines × 50 pixels)
+
+### InputTransaction
+
+Batch container for input events.
+
+```typescript
+// Create new transaction
+InputTransaction.create(): InputTransaction
+
+// Add event to transaction
+add_event(event: DeviceEvent): void
+```
+
+Input transactions are applied atomically to minimize RDP round-trips.
+
+## Clipboard API
+
+### ClipboardData
+
+Represents clipboard content with multiple format items.
+
+```typescript
+// Create empty clipboard data
+ClipboardData.create(): ClipboardData
+
+// Add text format
+add_text(mime_type: string, text: string): void
+
+// Add binary format
+add_binary(mime_type: string, binary: Uint8Array): void
+
+// Get all items
+items(): ClipboardItem[]
+```
+
+### ClipboardItem
+
+Single clipboard format.
+
+```typescript
+// Get MIME type
+mime_type(): string
+
+// Get value (string or Uint8Array)
+value(): string | Uint8Array
+```
+
+#### Supported MIME Types
+
+- `text/plain`: Plain text
+- `text/html`: HTML content
+- `image/png`: PNG images
+
+The clipboard backend automatically converts between browser formats and RDP clipboard formats:
+- `CF_UNICODETEXT` ↔ `text/plain`
+- `HTML Format` / `text/html` ↔ browser HTML
+- `CF_DIB` / `CF_DIBV5` / `PNG` ↔ `image/png`
+
+## Cursor Style Callback
+
+The cursor style callback receives the following signature:
+
+```typescript
+function setCursorStyle(
+  kind: string,
+  data?: string,
+  hotspot_x?: number,
+  hotspot_y?: number
+): void
+```
+
+#### Cursor Kinds
+
+- `"default"`: System default cursor (other args are `undefined`)
+- `"hidden"`: Hide cursor (other args are `undefined`)
+- `"url"`: Custom cursor from Base64 data URL
+  - `data`: PNG data URL (`data:image/png;base64,...`)
+  - `hotspot_x`, `hotspot_y`: Cursor hotspot coordinates
+
+Large cursors (> 32×32) are automatically downscaled using Lanczos3 resampling to work within browser limitations.
+
+## Session Termination
+
+### SessionTerminationInfo
+
+Information about session end.
+
+```typescript
+// Get human-readable termination reason
+reason(): string
+```
+
+Possible reasons:
+- User-initiated disconnect
+- Server-initiated disconnect
+- Network error
+- Protocol error
+- Graceful shutdown
+
+## Error Handling
+
+### IronError
+
+All methods return `Result` types that throw `IronError` on failure.
+
+```typescript
+interface IronError {
+  kind: IronErrorKind;
+  message: string;
+}
+
+enum IronErrorKind {
+  General,
+  ProxyConnect,
+  RDCleanPath,
+  NegotiationFailure,
+  // ... other kinds
+}
+```
+
+## Types
+
+### DesktopSize
+
+```typescript
+interface DesktopSize {
+  width: number;   // 0-65535
+  height: number;  // 0-65535
+}
+```
+
+### CursorStyle
+
+```typescript
+type CursorStyle =
+  | { kind: "Default" }
+  | { kind: "Hidden" }
+  | { kind: "Url"; data: string; hotspot_x: number; hotspot_y: number }
+```
+
+## Architecture Notes
+
+- **Transport**: Uses WebSocket with automatic message chunking for large frames
+- **Rendering**: Direct pixel buffer updates to HTML5 Canvas via `softbuffer`
+- **Threading**: Single-threaded async execution using `wasm-bindgen-futures`
+- **Clipboard**: Eager format fetching (no delayed rendering due to browser limitations)
+- **Resize**: Requires RDP Display Control channel (DVC); triggers deactivation-reactivation sequence
+
+## Example Usage
+
+```typescript
+import { SessionBuilder, DeviceEvent, InputTransaction } from 'ironrdp-web';
+
+// Configure session
+const session = await SessionBuilder.create()
+  .username('user')
+  .password('pass')
+  .destination('10.0.0.1:3389')
+  .proxy_address('wss://proxy.example.com')
+  .auth_token('token123')
+  .desktop_size({ width: 1920, height: 1080 })
+  .render_canvas(document.getElementById('rdp-canvas'))
+  .set_cursor_style_callback(setCursorStyle)
+  .set_cursor_style_callback_context(this)
+  .remote_clipboard_changed_callback(onClipboardChanged)
+  .extension({ display_control: true })
+  .connect();
+
+// Start session
+const termination = await session.run();
+console.log('Session ended:', termination.reason());
+
+// Send input
+const tx = InputTransaction.create();
+tx.add_event(DeviceEvent.mouse_move(100, 200));
+tx.add_event(DeviceEvent.mouse_button_pressed(0));
+session.apply_inputs(tx);
+```
+
+## Related Crates
+
+- `ironrdp`: Core RDP protocol implementation
+- `ironrdp-connector`: Connection establishment
+- `ironrdp-session`: Session management
+- `ironrdp-cliprdr`: Clipboard redirection channel
+- `ironrdp-displaycontrol`: Display control channel
+- `iron-remote-desktop`: Remote desktop abstraction layer

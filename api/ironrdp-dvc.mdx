@@ -1,0 +1,356 @@
+---
+title: ironrdp-dvc
+description: RDP Dynamic Virtual Channel (DVC) support
+---
+
+<Note>
+**Version:** 0.5.0  
+**Docs.rs:** [ironrdp-dvc](https://docs.rs/ironrdp-dvc/latest/ironrdp_dvc/)
+</Note>
+
+## Overview
+
+The `ironrdp-dvc` crate provides infrastructure for RDP Dynamic Virtual Channels (DVCs). Unlike static channels (SVCs), dynamic channels:
+
+- Can be created and destroyed at any time during the session
+- Have no hard limit on the number of channels
+- Don't require packet reconstruction (handled by the DVC manager)
+- Use the DRDYNVC static channel as a control channel
+
+This crate provides:
+- The DRDYNVC static channel implementation
+- `DvcProcessor` trait for implementing custom DVCs
+- Client and server-side DVC managers
+
+## Core Traits
+
+### DvcProcessor
+
+```rust
+pub trait DvcProcessor: AsAny + Send {
+    fn channel_name(&self) -> &str;
+    fn start(&mut self, channel_id: u32) -> PduResult<Vec<DvcMessage>>;
+    fn process(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>>;
+    fn close(&mut self, _channel_id: u32) {}
+}
+```
+
+Implement this trait to create a custom dynamic virtual channel.
+
+**Methods:**
+
+<ParamField path="channel_name" type="fn(&self) -> &str">
+Returns the channel name (e.g., "Microsoft::Windows::RDS::Geometry")
+</ParamField>
+
+<ParamField path="start" type="fn(&mut self, channel_id: u32) -> PduResult<Vec<DvcMessage>>">
+Called when the channel is opened. Returns initial PDUs to send.
+</ParamField>
+
+<ParamField path="process" type="fn(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>>">
+Process a received PDU. Returns response PDUs to send.
+</ParamField>
+
+<ParamField path="close" type="fn(&mut self, channel_id: u32)">
+Called when the channel is closed (optional handler)
+</ParamField>
+
+### DvcEncode
+
+```rust
+pub trait DvcEncode: Encode + Send {}
+pub type DvcMessage = Box<dyn DvcEncode>;
+```
+
+Marker trait for types that can be sent as DVC messages. Similar to `SvcEncode`.
+
+## Client API
+
+### DrdynvcClient
+
+```rust
+pub struct DrdynvcClient { /* ... */ }
+
+impl DrdynvcClient {
+    pub fn new() -> Self;
+    
+    pub fn add_dvc<T: DvcProcessor + 'static>(&mut self, dvc: T);
+    
+    pub fn get_dvc_by_type<T: DvcProcessor + 'static>(&self) -> Option<&DynamicVirtualChannel>;
+    
+    pub fn initiate_open_channel<T: DvcProcessor + 'static>(
+        &mut self
+    ) -> PduResult<Vec<SvcMessage>>;
+    
+    pub fn process_complete_data(
+        &mut self,
+        payload: &[u8]
+    ) -> PduResult<Vec<SvcMessage>>;
+}
+```
+
+**Example:**
+
+```rust
+use ironrdp_dvc::*;
+use ironrdp_svc::*;
+
+// Create DRDYNVC client
+let mut drdynvc = DrdynvcClient::new();
+
+// Add custom DVCs
+drdynvc.add_dvc(MyDynamicChannel::new());
+drdynvc.add_dvc(AnotherDynamicChannel::new());
+
+// Register DRDYNVC as a static channel
+let mut channels = StaticChannelSet::new();
+channels.insert(drdynvc);
+
+// After connection, open a specific DVC
+if let Some(drdynvc) = channels.get_by_type_mut::<DrdynvcClient>() {
+    let messages = drdynvc.initiate_open_channel::<MyDynamicChannel>()?;
+    
+    // Encode and send messages
+    let encoded = client_encode_svc_messages(messages, drdynvc_channel_id, user_id)?;
+    // ... send encoded bytes
+}
+
+// Process received DRDYNVC data
+if let Some(drdynvc) = channels.get_by_channel_id_mut(drdynvc_channel_id) {
+    let responses = drdynvc.process(&received_data)?;
+    // ... encode and send responses
+}
+```
+
+## Server API
+
+### DrdynvcServer
+
+```rust
+pub struct DrdynvcServer { /* ... */ }
+
+impl DrdynvcServer {
+    pub fn new() -> Self;
+    
+    pub fn add_dvc<T: DvcProcessor + 'static>(&mut self, dvc: T);
+    
+    pub fn process_complete_data(
+        &mut self,
+        payload: &[u8]
+    ) -> PduResult<Vec<SvcMessage>>;
+}
+```
+
+Similar to the client but waits for clients to initiate channel creation.
+
+## DVC Message Encoding
+
+```rust
+pub fn encode_dvc_messages(
+    channel_id: u32,
+    messages: Vec<DvcMessage>,
+    flags: ironrdp_svc::ChannelFlags,
+) -> EncodeResult<Vec<SvcMessage>>
+```
+
+Encode DVC messages for transmission over the DRDYNVC static channel.
+
+**Parameters:**
+
+<ParamField path="channel_id" type="u32">
+The DVC channel ID (assigned by the server)
+</ParamField>
+
+<ParamField path="messages" type="Vec<DvcMessage>">
+Messages to encode
+</ParamField>
+
+<ParamField path="flags" type="ChannelFlags">
+Additional SVC flags (compression, etc.)
+</ParamField>
+
+This function automatically splits large messages using `DataFirstPdu` and `DataPdu`.
+
+## PDU Types
+
+```rust
+pub mod pdu {
+    pub enum DrdynvcDataPdu {
+        Data(DataPdu),
+        DataFirst(DataFirstPdu),
+    }
+    
+    pub struct DataPdu {
+        pub channel_id: u32,
+        pub data: Vec<u8>,
+    }
+    
+    pub struct DataFirstPdu {
+        pub channel_id: u32,
+        pub total_data_size: u32,
+        pub data: Vec<u8>,
+    }
+    
+    pub struct CreateRequestPdu {
+        pub channel_id: u32,
+        pub channel_name: String,
+    }
+    
+    pub struct CreateResponsePdu {
+        pub channel_id: u32,
+        pub creation_status: i32,
+    }
+    
+    pub struct ClosePdu {
+        pub channel_id: u32,
+    }
+}
+```
+
+## Implementation Example
+
+```rust
+use ironrdp_dvc::*;
+use ironrdp_core::{Encode, WriteCursor, EncodeResult};
+
+#[derive(Debug)]
+struct GeometryChannel {
+    // Channel state
+}
+
+impl GeometryChannel {
+    fn new() -> Self {
+        Self {}
+    }
+}
+
+ironrdp_core::impl_as_any!(GeometryChannel);
+
+impl DvcProcessor for GeometryChannel {
+    fn channel_name(&self) -> &str {
+        "Microsoft::Windows::RDS::Geometry"
+    }
+    
+    fn start(&mut self, channel_id: u32) -> PduResult<Vec<DvcMessage>> {
+        println!("Geometry channel {} opened", channel_id);
+        Ok(vec![])
+    }
+    
+    fn process(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
+        // Parse and handle geometry PDUs
+        let pdu = parse_geometry_pdu(payload)?;
+        
+        // Return response if needed
+        Ok(vec![])
+    }
+    
+    fn close(&mut self, channel_id: u32) {
+        println!("Geometry channel {} closed", channel_id);
+    }
+}
+
+struct GeometryPdu { /* ... */ }
+impl Encode for GeometryPdu {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        // Encode geometry data
+        Ok(())
+    }
+    fn name(&self) -> &'static str { "GeometryPdu" }
+    fn size(&self) -> usize { /* ... */ }
+}
+impl DvcEncode for GeometryPdu {}
+```
+
+## Internal Types
+
+### DynamicVirtualChannel
+
+```rust
+pub struct DynamicVirtualChannel { /* ... */ }
+
+impl DynamicVirtualChannel {
+    pub fn is_open(&self) -> bool;
+    pub fn channel_id(&self) -> Option<DynamicChannelId>;
+    pub fn channel_processor_downcast_ref<T: DvcProcessor>(&self) -> Option<&T>;
+}
+```
+
+Internal wrapper around a `DvcProcessor`. Handles message reassembly from `DataFirst` and `Data` PDUs.
+
+### Type Aliases
+
+```rust
+pub type DynamicChannelName = String;
+pub type DynamicChannelId = u32;
+```
+
+## Data Splitting
+
+DVC messages larger than `DrdynvcDataPdu::MAX_DATA_SIZE` are automatically split:
+
+```rust
+impl DrdynvcDataPdu {
+    pub const MAX_DATA_SIZE: usize = /* implementation defined */;
+}
+```
+
+The first fragment uses `DataFirstPdu` (includes total size), subsequent fragments use `DataPdu`.
+
+## Features
+
+<ParamField path="std" type="feature">
+Enables standard library support
+</ParamField>
+
+This crate supports `no_std` environments (with `alloc`).
+
+## Dependencies
+
+- `ironrdp-core` - Core traits (public)
+- `ironrdp-svc` - Static channel infrastructure (public)
+- `ironrdp-pdu` - PDU structures (public)
+- `slab` - Efficient channel ID allocation
+- `tracing` - Logging
+
+## Usage Notes
+
+<Note>
+**DVC Lifecycle:**  
+Dynamic channels go through these states:
+1. Added to `DrdynvcClient` (client) or `DrdynvcServer` (server)
+2. Create Request/Response exchanged
+3. Channel ID assigned
+4. `start()` called
+5. Data exchange via `process()`
+6. Close PDU exchanged
+7. `close()` called
+</Note>
+
+<Note>
+**Channel Naming:**  
+DVC names are typically hierarchical with `::`:
+- `Microsoft::Windows::RDS::DisplayControl`
+- `Microsoft::Windows::RDS::Geometry`
+- `Microsoft::Windows::RDS::VideoControl`
+
+Custom channels should follow a similar pattern.
+</Note>
+
+<Note>
+**Thread Safety:**  
+Both `DrdynvcClient` and `DrdynvcServer` require `Send` but not `Sync`. They're designed for single-threaded event loops or message-passing architectures.
+</Note>
+
+## Common Dynamic Channels
+
+IronRDP provides implementations for these standard DVCs:
+
+- `ironrdp-displaycontrol` - Display resolution/orientation control
+- `ironrdp-egfx` - Enhanced graphics pipeline (RemoteFX)
+- `ironrdp-rdpdr` - Device redirection (via DVC in some configurations)
+
+## See Also
+
+- [ironrdp-svc](/api/ironrdp-svc) - Static virtual channels
+- [ironrdp-pdu](/api/ironrdp-pdu) - PDU structures
+- [MS-RDPEDYC](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpedyc/) - DRDYNVC specification

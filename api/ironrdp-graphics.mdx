@@ -1,0 +1,255 @@
+---
+title: ironrdp-graphics
+description: Image processing primitives and algorithms for RDP
+---
+
+<Note>
+**Version:** 0.7.0  
+**Docs.rs:** [ironrdp-graphics](https://docs.rs/ironrdp-graphics/latest/ironrdp_graphics/)
+</Note>
+
+## Overview
+
+The `ironrdp-graphics` crate provides image processing primitives and compression algorithms used in RDP graphics rendering:
+
+- Color space conversions (RGB ↔ YUV)
+- Image compression (RLE, RLGR)
+- Bulk compression (ZGFX)
+- RemoteFX encoding components (DWT, quantization)
+- Bitmap difference calculations
+
+## Key Modules
+
+### Color Conversion
+
+```rust
+use ironrdp_graphics::color_conversion::*;
+```
+
+Convert between RGB and YUV color spaces for video compression.
+
+### Compression Algorithms
+
+#### RLE (Run-Length Encoding)
+
+```rust
+use ironrdp_graphics::rle::*;
+
+pub mod rle {
+    pub struct Code(u8);
+    
+    impl Code {
+        pub const REGULAR_BG_RUN: Self = Self(0x00);
+        pub const MEGA_MEGA_BG_RUN: Self = Self(0xF0);
+        // ... other codes
+    }
+}
+```
+
+RLE compression for bitmap data.
+
+#### RLGR (Run-Length Golomb-Rice)
+
+```rust
+use ironrdp_graphics::rlgr::*;
+use ironrdp_pdu::codecs::rfx::EntropyAlgorithm;
+
+pub fn encode(
+    mode: EntropyAlgorithm,
+    input: &[i16],
+    output: &mut [u8]
+) -> Result<usize, RlgrError>
+```
+
+Entropy encoding used in RemoteFX.
+
+#### ZGFX (Bulk Compression)
+
+```rust
+use ironrdp_graphics::zgfx::*;
+
+pub struct Decompressor { /* ... */ }
+
+impl Decompressor {
+    pub fn new() -> Self;
+    pub fn decompress(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize, ZgfxError>;
+}
+```
+
+Bulk compression for large data transfers.
+
+### RemoteFX Components
+
+#### DWT (Discrete Wavelet Transform)
+
+```rust
+use ironrdp_graphics::dwt::*;
+
+pub fn encode(input: &mut [i16], temp: &mut [i16]);
+pub fn decode(input: &mut [i16], temp: &mut [i16]);
+```
+
+Wavelet transform used in RemoteFX image encoding.
+
+#### Quantization
+
+```rust
+use ironrdp_graphics::quantization::*;
+use ironrdp_pdu::codecs::rfx::Quant;
+
+pub fn encode(data: &mut [i16], quant: &Quant);
+pub fn decode(data: &mut [i16], quant: &Quant);
+```
+
+Quantization for lossy compression in RemoteFX.
+
+#### Subband Reconstruction
+
+```rust
+use ironrdp_graphics::subband_reconstruction::*;
+
+pub fn encode(ll3: &mut [i16]);
+pub fn decode(ll3: &mut [i16]);
+```
+
+Reconstruct image subbands after wavelet transform.
+
+### RDP 6 Compression
+
+```rust
+use ironrdp_graphics::rdp6::*;
+```
+
+RDP 6.0/6.1 specific compression algorithms.
+
+### Image Processing Utilities
+
+```rust
+use ironrdp_graphics::image_processing::*;
+```
+
+General image manipulation functions.
+
+### Rectangle Processing
+
+```rust
+use ironrdp_graphics::rectangle_processing::*;
+```
+
+Rectangle and region calculations.
+
+### Bitmap Difference
+
+```rust
+use ironrdp_graphics::diff::*;
+```
+
+Compute differences between bitmap frames.
+
+### Pointer (Cursor) Handling
+
+```rust
+use ironrdp_graphics::pointer::*;
+```
+
+Cursor image processing.
+
+## RemoteFX Encoding
+
+The crate provides a high-level function for encoding RemoteFX components:
+
+```rust
+pub fn rfx_encode_component(
+    input: &mut [i16],
+    output: &mut [u8],
+    quant: &ironrdp_pdu::codecs::rfx::Quant,
+    mode: ironrdp_pdu::codecs::rfx::EntropyAlgorithm,
+) -> Result<usize, rlgr::RlgrError>
+```
+
+**Parameters:**
+
+<ParamField path="input" type="&mut [i16]">
+Component data (must be 4096 elements = 64×64 pixels). Modified in-place during encoding.
+</ParamField>
+
+<ParamField path="output" type="&mut [u8]">
+Buffer to receive encoded data
+</ParamField>
+
+<ParamField path="quant" type="&Quant">
+Quantization parameters from `ironrdp_pdu::codecs::rfx::Quant`
+</ParamField>
+
+<ParamField path="mode" type="EntropyAlgorithm">
+Entropy algorithm (RLGR1 or RLGR3)
+</ParamField>
+
+**Panics:**
+
+Panics if `input.len() != 4096`.
+
+**Example:**
+
+```rust
+use ironrdp_graphics::rfx_encode_component;
+use ironrdp_pdu::codecs::rfx::{Quant, EntropyAlgorithm};
+
+let mut input = vec![0i16; 64 * 64];
+let mut output = vec![0u8; 8192];
+
+let quant = Quant::default();
+let encoded_size = rfx_encode_component(
+    &mut input,
+    &mut output,
+    &quant,
+    EntropyAlgorithm::Rlgr3,
+)?;
+```
+
+The encoding pipeline:
+1. DWT (Discrete Wavelet Transform)
+2. Quantization
+3. Subband reconstruction
+4. RLGR entropy encoding
+
+## Dependencies
+
+This crate depends on:
+
+- `ironrdp-core` - Core traits (public)
+- `ironrdp-pdu` - PDU structures for codec parameters (public)
+- `yuv` - YUV color conversion with RDP-specific features
+- `bit_field`, `bitflags`, `bitvec` - Bit manipulation
+
+## Usage Notes
+
+<Note>
+**Performance:**  
+Many functions in this crate operate on large buffers in-place. Pre-allocate buffers and reuse them to avoid repeated allocations:
+
+```rust
+let mut temp = vec![0i16; 64 * 64];
+for tile in tiles {
+    ironrdp_graphics::dwt::encode(&mut tile, &mut temp);
+}
+```
+</Note>
+
+<Note>
+**Image Formats:**  
+RemoteFX operates on 64×64 tiles in YUV color space. Convert from RGB before encoding:
+
+```rust
+use ironrdp_graphics::color_conversion::rgb_to_yuv;
+
+// Convert RGB tile to YUV
+let (y, u, v) = rgb_to_yuv(&rgb_data, width, height);
+```
+</Note>
+
+## See Also
+
+- [ironrdp-pdu](/api/ironrdp-pdu) - Codec parameter structures
+- [ironrdp-session](/api/ironrdp-session) - Session-level graphics handling
+- [MS-RDPRFX](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdprfx/) - RemoteFX protocol specification

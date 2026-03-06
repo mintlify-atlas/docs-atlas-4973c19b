@@ -1,0 +1,593 @@
+---
+title: 'FFI Bindings'
+description: 'Foreign Function Interface bindings for IronRDP'
+---
+
+# IronRDP FFI
+
+Foreign Function Interface (FFI) bindings for IronRDP, built using [Diplomat](https://github.com/rust-diplomat/diplomat). These bindings enable IronRDP usage from other programming languages.
+
+## Overview
+
+The IronRDP FFI provides a C-compatible API layer that can be consumed by various programming languages. Currently, .NET is the officially supported target platform with full bindings and examples.
+
+**Source**: `ffi/`
+
+## Supported Platforms
+
+### .NET (Official)
+
+- **Namespace**: `Devolutions.IronRdp`
+- **Package**: Available as NuGet package
+- **Platforms**: Windows, macOS, Linux, iOS
+- **Language**: C# 
+
+### Other Languages
+
+The Diplomat-based FFI can theoretically support:
+- C/C++
+- JavaScript (via WebAssembly)
+- Other languages with C interop
+
+However, only .NET bindings are officially maintained and tested.
+
+## Building
+
+### Prerequisites
+
+1. Rust toolchain (1.88.0 or later)
+2. Diplomat tool: `cargo xtask ffi install`
+3. .NET SDK (for .NET bindings)
+
+### Build Steps
+
+```bash
+# Install required tools
+cargo xtask ffi install
+
+# Build the native library
+cargo xtask ffi build
+
+# Or for release builds
+cargo xtask ffi build --release
+
+# Generate bindings
+cargo xtask ffi bindings
+```
+
+This produces:
+- `target/debug/libdevolutions_ironrdp.{so|dylib|dll}` - Native library
+- `ffi/dotnet/Devolutions.IronRdp/Generated/` - C# bindings
+
+## .NET API
+
+### Installation
+
+```bash
+dotnet add package Devolutions.IronRdp
+```
+
+### Core Modules
+
+The FFI is organized into the following modules:
+
+| Module | Description |
+|--------|-------------|
+| `connector` | Connection establishment and protocol negotiation |
+| `session` | Active RDP session management |
+| `input` | Keyboard and mouse input handling |
+| `graphics` | Graphics rendering and pointer handling |
+| `clipboard` | Clipboard redirection (CLIPRDR) |
+| `pdu` | Protocol Data Unit encoding/decoding |
+| `error` | Error types and handling |
+| `utils` | Utility types and helpers |
+| `dvc` | Dynamic Virtual Channel support |
+| `svc` | Static Virtual Channel support |
+| `rdcleanpath` | RDCleanPath protocol support |
+| `credssp` | CredSSP/NLA authentication |
+
+## Connection Establishment
+
+### ClientConnector
+
+The `ClientConnector` class manages the RDP connection sequence.
+
+```csharp
+using Devolutions.IronRdp;
+
+// Create configuration
+var config = new Config(
+    username: "user",
+    password: "password",
+    domain: "DOMAIN",
+    desktopWidth: 1920,
+    desktopHeight: 1080
+);
+
+// Create connector
+var connector = new ClientConnector(config, "127.0.0.1:54321");
+
+// Attach static channels
+connector.WithStaticChannelRdpSnd();
+connector.WithStaticChannelRdpdr("COMPUTER", smartCardDeviceId: 0);
+
+// Configure dynamic channels
+connector.WithDynamicChannelDisplayControl();
+connector.WithDynamicChannelPipeProxy(proxyConfig);
+
+// Perform connection sequence
+var state = connector.GetDynState();
+while (!state.IsTerminal())
+{
+    var writeBuf = new WriteBuf();
+    var written = connector.Step(inputData, writeBuf);
+    
+    // Handle security upgrade if needed
+    if (connector.ShouldPerformSecurityUpgrade())
+    {
+        // Perform TLS handshake
+        connector.MarkSecurityUpgradeAsDone();
+    }
+    
+    // Handle CredSSP if needed
+    if (connector.ShouldPerformCredssp())
+    {
+        // Perform NLA authentication
+        connector.MarkCredsspAsDone();
+    }
+    
+    state = connector.GetDynState();
+}
+
+// Get connection result
+var result = connector.ConsumeAndCastToClientConnectorState();
+```
+
+### Config
+
+Connection configuration parameters.
+
+```csharp
+var config = new Config(
+    username: "user",
+    password: "password",
+    domain: null,  // Optional
+    desktopWidth: 1920,
+    desktopHeight: 1080
+);
+
+// Additional configuration
+config.EnableTls = true;
+config.EnableCredssp = true;
+config.KeyboardType = KeyboardType.IbmEnhanced;
+config.EnableAudioPlayback = false;
+```
+
+## Session Management
+
+### ActiveStage
+
+Represents an active RDP session after connection is established.
+
+```csharp
+// Create from connection result
+var activeStage = new ActiveStage(connectionResult);
+
+// Process incoming RDP frames
+var image = new DecodedImage(PixelFormat.RgbA32, width, height);
+var outputs = activeStage.Process(image, action, payload);
+
+// Handle outputs
+foreach (var output in outputs)
+{
+    switch (output.GetEnumType())
+    {
+        case ActiveStageOutputType.ResponseFrame:
+            var frame = output.GetResponseFrame();
+            // Send frame to server
+            break;
+            
+        case ActiveStageOutputType.GraphicsUpdate:
+            var rect = output.GetGraphicsUpdate();
+            // Update display region
+            break;
+            
+        case ActiveStageOutputType.PointerBitmap:
+            var pointer = output.GetPointerBitmap();
+            // Update cursor image
+            break;
+            
+        case ActiveStageOutputType.Terminate:
+            var reason = output.GetTerminate();
+            // Handle disconnection
+            break;
+    }
+}
+```
+
+### FastPath Input
+
+Send keyboard and mouse input to the remote session.
+
+```csharp
+// Create input events
+var events = new FastPathInputEventIterator();
+events.Add(FastPathInputEvent.KeyPressed(scancode));
+events.Add(FastPathInputEvent.MouseMove(x, y));
+events.Add(FastPathInputEvent.MouseButtonPressed(button));
+
+// Process input
+var outputs = activeStage.ProcessFastpathInput(image, events);
+```
+
+## Graphics and Rendering
+
+### DecodedImage
+
+Represents the decoded RDP framebuffer.
+
+```csharp
+// Create image buffer
+var image = new DecodedImage(
+    PixelFormat.RgbA32,
+    width: 1920,
+    height: 1080
+);
+
+// Access pixel data
+var data = image.GetData();
+var stride = image.GetStride();
+
+// Copy region to display buffer
+var region = output.GetGraphicsUpdate();
+// Use data[region.Top * stride + region.Left] to access pixels
+```
+
+### DecodedPointer
+
+Represents a cursor/pointer bitmap.
+
+```csharp
+var pointer = output.GetPointerBitmap();
+
+var width = pointer.GetWidth();
+var height = pointer.GetHeight();
+var hotspotX = pointer.GetHotspotX();
+var hotspotY = pointer.GetHotspotY();
+var data = pointer.GetData(); // RGBA pixel data
+```
+
+## Clipboard Redirection
+
+### Cliprdr
+
+Manages clipboard synchronization between local and remote sessions.
+
+```csharp
+// Create clipboard backend
+var backend = new YourClipboardBackend();
+var cliprdr = new Cliprdr(backend);
+
+// Attach to connector
+connector.AttachStaticCliprdr(cliprdr);
+
+// Later in active stage:
+// Initiate copy from local to remote
+var formats = new ClipboardFormatIterator();
+formats.Add(ClipboardFormat.UnicodeText);
+formats.Add(ClipboardFormat.Html);
+var frame = activeStage.InitiateClipboardCopy(formats);
+
+// Initiate paste from remote to local
+var formatId = new ClipboardFormatId(ClipboardFormatId.CF_UNICODETEXT);
+var frame = activeStage.InitiateClipboardPaste(formatId);
+
+// Submit format data response
+var response = new FormatDataResponse(data);
+var frame = activeStage.SubmitClipboardFormatData(response);
+```
+
+### Clipboard Formats
+
+Standard clipboard format IDs:
+
+- `CF_TEXT` (1): Plain text (ANSI)
+- `CF_UNICODETEXT` (13): Unicode text
+- `CF_DIB` (8): Device-independent bitmap
+- `CF_DIBV5` (17): DIB with color space
+- Custom formats: Use registered format IDs (> 0xC000)
+
+## Dynamic Virtual Channels
+
+### Display Control
+
+Enable dynamic resolution changes.
+
+```csharp
+// Enable during connection
+connector.WithDynamicChannelDisplayControl();
+
+// Later, request resize
+var outputs = activeStage.EncodedResize(width: 2560, height: 1440);
+```
+
+### DVC Pipe Proxy
+
+Proxy DVC traffic to named pipes (Windows).
+
+```csharp
+var config = new DvcPipeProxyConfig();
+config.AddDescriptor(new DvcPipeProxyDescriptor
+{
+    ChannelName = "custom-dvc",
+    PipeName = @"\\.\pipe\my-pipe"
+});
+
+connector.WithDynamicChannelPipeProxy(config);
+
+// Receive messages
+messageSink.OnMessage((channelId, data) => {
+    // Handle DVC message
+});
+
+// Send messages
+var message = new DvcPipeProxyMessage(channelId, data);
+var frame = activeStage.SendDvcPipeProxyMessage(message);
+```
+
+## Error Handling
+
+### IronRdpError
+
+All FFI methods return `Result<T, IronRdpError>` which throws exceptions in .NET.
+
+```csharp
+try
+{
+    var connector = new ClientConnector(config, clientAddr);
+}
+catch (IronRdpException ex)
+{
+    Console.WriteLine($"Error: {ex.Message}");
+    Console.WriteLine($"Kind: {ex.Kind}");
+}
+```
+
+### Error Kinds
+
+```csharp
+public enum IronRdpErrorKind
+{
+    Generic,
+    PduError,
+    EncodeError,
+    DecodeError,
+    CredsspError,
+    Consumed,
+    IO,
+    AccessDenied,
+    IncorrectEnumType,
+    Clipboard,
+    WrongOS
+}
+```
+
+## PDU Handling
+
+### Action and WriteBuf
+
+Low-level PDU processing.
+
+```csharp
+// Determine action from incoming data
+var action = Action.FromBytes(data);
+
+// Allocate output buffer
+var writeBuf = new WriteBuf();
+
+// Process with action
+var written = connector.Step(data, writeBuf);
+
+// Get encoded output
+var outputData = writeBuf.GetData();
+```
+
+### PduHint
+
+Used for frame detection in raw byte streams.
+
+```csharp
+var hint = connector.NextPduHint();
+if (hint != null)
+{
+    var sizeResult = hint.FindSize(incomingBytes);
+    if (sizeResult.HasValue)
+    {
+        var frameSize = sizeResult.Value;
+        // Read exactly frameSize bytes
+    }
+}
+```
+
+## Utilities
+
+### Common Types
+
+```csharp
+// Optional values
+public class OptionalUsize
+{
+    public bool HasValue { get; }
+    public usize Value { get; }
+}
+
+// Positions
+public struct Position
+{
+    public ushort X { get; set; }
+    public ushort Y { get; set; }
+}
+
+// Rectangles
+public struct InclusiveRectangle
+{
+    public ushort Left { get; set; }
+    public ushort Top { get; set; }
+    public ushort Right { get; set; }
+    public ushort Bottom { get; set; }
+}
+
+// Byte slices
+public class BytesSlice
+{
+    public byte[] GetData();
+}
+
+// Byte vectors
+public class VecU8
+{
+    public byte[] GetData();
+}
+```
+
+## Platform-Specific Features
+
+### Windows Clipboard
+
+Native Windows clipboard integration.
+
+```csharp
+#if WINDOWS
+var backend = new WinCliprdrBackend();
+var cliprdr = new Cliprdr(backend);
+connector.AttachStaticCliprdr(cliprdr);
+#endif
+```
+
+### iOS Support
+
+The NuGet package includes iOS bindings with platform-specific properties:
+
+- `Devolutions.IronRdp.iOS.props`
+- `Devolutions.IronRdp.Build.iOS.props`
+
+## Examples
+
+### Connect Example
+
+```bash
+cd ffi/dotnet
+dotnet run --project Devolutions.IronRdp.ConnectExample
+```
+
+A console application demonstrating basic RDP connection establishment.
+
+### Avalonia Example
+
+```bash
+cd ffi/dotnet
+dotnet run --project Devolutions.IronRdp.AvaloniaExample
+```
+
+A full GUI application using Avalonia framework with:
+- RDP session rendering
+- Input handling
+- Clipboard integration
+- Resize support
+
+## Memory Management
+
+### Ownership
+
+The FFI uses Rust's ownership model:
+
+- Most objects are returned as `Box<T>` (owned pointers)
+- Some objects are consumed by methods (marked with `&mut` and `take()`)
+- Objects are automatically freed when disposed
+
+### Consumed Values
+
+Some operations consume their inputs:
+
+```csharp
+// This consumes the connector
+var state = connector.ConsumeAndCastToClientConnectorState();
+
+// connector is now invalid - don't use it again
+```
+
+Methods that consume values are clearly documented and will return `Consumed` errors if called on already-consumed objects.
+
+## Thread Safety
+
+The FFI is **not thread-safe** by default. All operations on a given RDP session must be performed from a single thread. For multi-threaded scenarios, implement your own synchronization.
+
+## Performance Considerations
+
+- **Zero-copy where possible**: The FFI minimizes data copying using byte slices
+- **Preallocate buffers**: Reuse `WriteBuf` instances to reduce allocations
+- **Batch input events**: Use `FastPathInputEventIterator` to send multiple events at once
+
+## Diplomat Configuration
+
+The .NET bindings are configured via `dotnet-interop-conf.toml`:
+
+```toml
+namespace = "Devolutions.IronRdp"
+native_lib = "DevolutionsIronRdp"
+
+[exceptions]
+trim_suffix = "Error"
+error_message_method = "ToDisplay"
+
+[properties]
+setters_prefix = "set_"
+getters_prefix = "get_"
+```
+
+## Troubleshooting
+
+### Library Not Found
+
+Ensure the native library is in the correct location:
+- Windows: `DevolutionsIronRdp.dll`
+- macOS: `libDevolutionsIronRdp.dylib`
+- Linux: `libDevolutionsIronRdp.so`
+
+The NuGet package includes platform-specific native libraries that are automatically deployed.
+
+### Value Consumed Errors
+
+If you see "value is consumed" errors:
+1. Check if you've called a consuming method
+2. Don't reuse objects after consumption
+3. Some methods like `Step()` are non-consuming and can be called multiple times
+
+### IncorrectEnumType Errors
+
+These occur when calling variant-specific methods on enum-like types:
+
+```csharp
+// Wrong - output might not be ResponseFrame
+var frame = output.GetResponseFrame(); // Throws if wrong type
+
+// Right - check type first
+if (output.GetEnumType() == ActiveStageOutputType.ResponseFrame)
+{
+    var frame = output.GetResponseFrame(); // Safe
+}
+```
+
+## Related Documentation
+
+- [Diplomat](https://github.com/rust-diplomat/diplomat): FFI generation tool
+- [IronRDP Architecture](../architecture): Overall project structure
+- [ironrdp-web](./ironrdp-web): WebAssembly bindings
+
+## Future Development
+
+Planned improvements:
+- JavaScript/TypeScript bindings via Diplomat
+- Python bindings
+- Additional platform support (Android, more .NET platforms)
+- Async API variants

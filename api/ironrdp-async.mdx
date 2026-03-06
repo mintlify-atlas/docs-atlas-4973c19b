@@ -1,0 +1,302 @@
+---
+title: ironrdp-async
+description: Async I/O abstractions for IronRDP state machines
+---
+
+`ironrdp-async` provides async I/O abstractions that wrap IronRDP state machines with Future-based APIs, enabling concurrent RDP connections with runtime-agnostic implementations.
+
+## Overview
+
+This crate builds `Future`s on top of `ironrdp-connector` state machines, providing:
+
+- Runtime-agnostic async I/O traits
+- Framed wrapper for buffered async protocol handling
+- Cancel-safe async operations
+- Integration points for Tokio, futures, and other runtimes
+
+## Core Traits
+
+### FramedRead
+
+Defines async reading from a stream into a buffer:
+
+```rust
+pub trait FramedRead {
+    type ReadFut<'read>: Future<Output = io::Result<usize>> + 'read
+    where
+        Self: 'read;
+
+    fn read<'a>(&'a mut self, buf: &'a mut BytesMut) -> Self::ReadFut<'a>;
+}
+```
+
+This trait is implemented by runtime-specific wrappers like `TokioStream` or `FuturesStream`.
+
+### FramedWrite
+
+Defines async writing to a stream:
+
+```rust
+pub trait FramedWrite {
+    type WriteAllFut<'write>: Future<Output = io::Result<()>> + 'write
+    where
+        Self: 'write;
+
+    fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Self::WriteAllFut<'a>;
+}
+```
+
+### StreamWrapper
+
+Adapter trait for wrapping runtime-specific stream types:
+
+```rust
+pub trait StreamWrapper: Sized {
+    type InnerStream;
+
+    fn from_inner(stream: Self::InnerStream) -> Self;
+    fn into_inner(self) -> Self::InnerStream;
+    fn get_inner(&self) -> &Self::InnerStream;
+    fn get_inner_mut(&mut self) -> &mut Self::InnerStream;
+}
+```
+
+## Framed Wrapper
+
+The `Framed<S>` type provides buffered async frame reading and writing:
+
+```rust
+use ironrdp_async::{Framed, StreamWrapper};
+
+// S must implement StreamWrapper
+let framed = Framed::<S>::new(stream);
+```
+
+### Reading Frames (Cancel Safe)
+
+All read operations are **cancel safe** - you can safely drop the future and recreate it later without data loss. Partial reads are buffered internally.
+
+**Read Exact Bytes**
+
+```rust
+// Accumulate and return exactly 1024 bytes
+let data = framed.read_exact(1024).await?;
+```
+
+**Read PDU Frames**
+
+```rust
+let (action, frame) = framed.read_pdu().await?;
+
+match action {
+    ironrdp_pdu::Action::FastPath => {
+        // Handle fast-path frame
+    }
+    ironrdp_pdu::Action::X224 => {
+        // Handle X.224 frame
+    }
+}
+```
+
+**Read by Hint**
+
+```rust
+use ironrdp_pdu::PduHint;
+
+let hint: &dyn PduHint = /* ... */;
+let bytes = framed.read_by_hint(hint).await?;
+```
+
+### Writing Frames (Not Cancel Safe)
+
+Write operations are **not cancel safe**. If cancelled mid-write, partial data may be written:
+
+```rust
+let pdu_bytes = /* encode your PDU */;
+framed.write_all(&pdu_bytes).await?;
+```
+
+<Warning>
+  Do not use `write_all` in `tokio::select!` branches unless you're prepared to handle partial writes.
+</Warning>
+
+### Stream Access
+
+```rust
+// Peek at buffered data
+let buffered = framed.peek();
+
+// Get inner stream references
+let (stream, buffer) = framed.get_inner();
+let (stream, buffer) = framed.get_inner_mut();
+
+// Extract the stream
+let (stream, leftover) = framed.into_inner();
+let stream = framed.into_inner_no_leftover();
+```
+
+## Connection Sequence
+
+Async functions to drive the RDP connection sequence.
+
+### Basic Flow
+
+```rust
+use ironrdp_async::{connect_begin, mark_as_upgraded, connect_finalize};
+use ironrdp_async::NetworkClient;
+
+// Phase 1: Initial negotiation
+let should_upgrade = connect_begin(&mut framed, &mut connector).await?;
+
+// Phase 2: Perform TLS upgrade
+let tls_stream = /* upgrade to TLS */;
+let mut framed = Framed::<S>::new(tls_stream);
+
+// Mark upgrade complete
+let upgraded = mark_as_upgraded(should_upgrade, &mut connector);
+
+// Phase 3: Finalize (including CredSSP)
+let result = connect_finalize(
+    upgraded,
+    connector,
+    &mut framed,
+    &mut network_client,
+    server_name,
+    server_public_key,
+    kerberos_config,
+).await?;
+```
+
+### NetworkClient Trait
+
+For CredSSP and network authentication:
+
+```rust
+pub trait NetworkClient {
+    fn send(
+        &mut self,
+        network_request: &NetworkRequest
+    ) -> impl Future<Output = ConnectorResult<Vec<u8>>>;
+}
+```
+
+Implement this trait to handle HTTP requests needed for authentication protocols.
+
+### Single Sequence Step
+
+For manual sequence control:
+
+```rust
+use ironrdp_async::single_sequence_step;
+use ironrdp_core::WriteBuf;
+
+let mut buf = WriteBuf::new();
+single_sequence_step(&mut framed, &mut connector, &mut buf).await?;
+```
+
+You can also split this into read and write phases:
+
+```rust
+use ironrdp_async::{single_sequence_step_read, single_sequence_step_write};
+
+// Read phase
+let written = single_sequence_step_read(&mut framed, &mut connector, &mut buf).await?;
+
+// Do other work...
+
+// Write phase
+single_sequence_step_write(&mut framed, &buf, written).await?;
+```
+
+## Runtime Integration
+
+This crate is **runtime-agnostic**. It defines traits that runtime-specific crates implement:
+
+- **ironrdp-tokio**: Tokio runtime integration
+- **ironrdp-futures**: futures-rs runtime integration
+
+You typically don't use `ironrdp-async` directly. Instead, use one of the runtime-specific crates that re-exports everything from `ironrdp-async` plus runtime adapters.
+
+## Cancel Safety
+
+Understanding cancel safety is crucial when using this crate with `select!` or other cancellation mechanisms:
+
+### Cancel Safe Operations
+
+- `read_exact` - Partial reads are buffered internally
+- `read_pdu` - Frame parsing state is maintained
+- `read_by_hint` - Buffering ensures no data loss
+
+### Not Cancel Safe Operations
+
+- `write_all` - May result in partial writes if cancelled
+
+```rust
+tokio::select! {
+    // Safe: read operations
+    result = framed.read_pdu() => {
+        // Handle frame
+    }
+    // Unsafe: write operations may leave partial data
+    result = framed.write_all(&data) => {
+        // If this branch isn't selected, write may be partial
+    }
+}
+```
+
+## Architecture Pattern
+
+The async layer follows a clean separation:
+
+```
+┌─────────────────────────┐
+│   Your Application      │
+└──────────┬──────────────┘
+           │
+┌──────────▼──────────────┐
+│  ironrdp-async          │  ← Async I/O abstraction
+│  (runtime-agnostic)     │
+└──────────┬──────────────┘
+           │
+┌──────────▼──────────────┐
+│  ironrdp-tokio or       │  ← Runtime adapter
+│  ironrdp-futures        │
+└──────────┬──────────────┘
+           │
+┌──────────▼──────────────┐
+│  ironrdp-connector      │  ← State machines
+└─────────────────────────┘
+```
+
+This design:
+
+- Keeps protocol logic separate from I/O
+- Allows supporting multiple async runtimes
+- Enables testing without real I/O
+
+## When to Use
+
+Use `ironrdp-async` (via runtime crates) when:
+
+- You need concurrent RDP connections
+- You're building high-performance services
+- You're already using Tokio or async-std
+- You need efficient resource utilization
+
+For simpler blocking I/O, use [ironrdp-blocking](/api/ironrdp-blocking) instead.
+
+## Dependencies
+
+- **ironrdp-connector**: Connection state machines
+- **ironrdp-core**: Core RDP types
+- **ironrdp-pdu**: PDU encoding/decoding
+- **bytes**: Efficient byte buffers
+- **tracing**: Structured logging
+
+## Related Crates
+
+- [ironrdp-blocking](/api/ironrdp-blocking) - Blocking I/O alternative
+- [ironrdp-tokio](/api/ironrdp-tokio) - Tokio runtime integration
+- [ironrdp-futures](/api/ironrdp-futures) - futures runtime integration
+- [ironrdp-connector](/api/ironrdp-connector) - Connection state machines
+- [ironrdp-tls](/api/ironrdp-tls) - TLS upgrade helpers

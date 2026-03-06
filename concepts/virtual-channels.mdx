@@ -1,0 +1,593 @@
+---
+title: Virtual Channels
+description: Understanding and implementing static and dynamic virtual channels in RDP
+---
+
+Virtual channels enable bidirectional communication between RDP client and server components beyond the standard graphics and input streams. IronRDP supports both Static Virtual Channels (SVCs) and Dynamic Virtual Channels (DVCs).
+
+## Channel Architecture
+
+RDP supports up to **32 static channels** per connection:
+- **1 mandatory I/O channel**: Carries graphics, input, and control traffic
+- **31 optional static channels**: Custom bidirectional data streams
+
+Dynamic channels are created within a special static channel called **DRDYNVC**, allowing unlimited dynamic channels to be opened and closed during the session.
+
+## Static Virtual Channels (SVCs)
+
+Static channels are established during connection setup and persist for the session lifetime.
+
+### Core Concepts
+
+**Channel Definition** — SVCs are registered in the Client Network Data GCC block:
+
+```rust
+// From ironrdp-connector/src/connection.rs:664-666
+let channels = static_channels
+    .map(ironrdp_svc::make_channel_definition)
+    .collect::<Vec<_>>();
+```
+
+Each channel has:
+- **8-byte name**: ASCII identifier (e.g., `"CLIPRDR"`, `"RDPSND"`, `"RDPDR"`)
+- **Options**: Compression settings
+- **Channel ID**: Assigned by server during Basic Settings Exchange
+
+**Chunking** — Large PDUs are automatically split into ~1600 byte chunks:
+
+```rust
+pub const CHANNEL_CHUNK_LENGTH: usize = 1600;
+```
+
+Each chunk includes a Channel PDU Header (`CHANNEL_PDU_HEADER`):
+
+```rust
+struct ChannelPduHeader {
+    length: u32,      // Total uncompressed PDU length
+    flags: ChannelFlags,  // FIRST, LAST, COMPRESSED, etc.
+}
+```
+
+See `ironrdp-svc/src/lib.rs:655-686`.
+
+### Implementing an SVC
+
+Implement the `SvcProcessor` trait:
+
+```rust
+use ironrdp_svc::{SvcClientProcessor, SvcProcessor, SvcMessage};
+use ironrdp_pdu::gcc::ChannelName;
+use ironrdp_pdu::PduResult;
+use ironrdp_core::{impl_as_any, AsAny};
+
+#[derive(Debug)]
+struct MyChannel {
+    // Channel state
+}
+
+impl_as_any!(MyChannel);
+
+impl SvcProcessor for MyChannel {
+    fn channel_name(&self) -> ChannelName {
+        ChannelName::from_bytes(b"MYCHAN\0\0").unwrap()
+    }
+    
+    fn start(&mut self) -> PduResult<Vec<SvcMessage>> {
+        // Called after channel is joined
+        // Return initial PDUs to send to server
+        Ok(vec![])
+    }
+    
+    fn process(&mut self, payload: &[u8]) -> PduResult<Vec<SvcMessage>> {
+        // Process received PDU (already de-chunkified)
+        // Return response PDUs
+        
+        let response = MyChannelResponse { /* ... */ };
+        Ok(vec![response.into()])
+    }
+}
+
+impl SvcClientProcessor for MyChannel {}
+```
+
+See `ironrdp-svc/src/lib.rs:258-295`.
+
+### SvcMessage and Encoding
+
+Response PDUs must implement `SvcEncode`:
+
+```rust
+use ironrdp_svc::{SvcEncode, SvcMessage};
+use ironrdp_core::{Encode, WriteCursor, EncodeResult};
+
+#[derive(Debug)]
+struct MyChannelResponse {
+    data: Vec<u8>,
+}
+
+impl Encode for MyChannelResponse {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        dst.write_slice(&self.data);
+        Ok(())
+    }
+    
+    fn name(&self) -> &'static str {
+        "MyChannelResponse"
+    }
+    
+    fn size(&self) -> usize {
+        self.data.len()
+    }
+}
+
+impl SvcEncode for MyChannelResponse {}
+```
+
+Convert to `SvcMessage`:
+
+```rust
+let message: SvcMessage = response.into();
+
+// Add additional flags if needed
+let message = message.with_flags(ChannelFlags::COMPRESSED);
+```
+
+See `ironrdp-svc/src/lib.rs:68-121`.
+
+### Registering Channels
+
+Add channels to the connector before connection:
+
+```rust
+use ironrdp_connector::ClientConnector;
+
+let my_channel = MyChannel::new();
+let connector = ClientConnector::new(config, client_addr)
+    .with_static_channel(my_channel);
+
+// Or add after creation
+connector.attach_static_channel(another_channel);
+```
+
+Channels are stored in a `StaticChannelSet`:
+
+```rust
+pub struct StaticChannelSet {
+    channels: BTreeMap<TypeId, StaticVirtualChannel>,
+    to_channel_id: BTreeMap<TypeId, StaticChannelId>,
+    to_type_id: BTreeMap<StaticChannelId, TypeId>,
+}
+```
+
+This enables retrieval by:
+- **Type**: `get_by_type::<MyChannel>()`
+- **Channel ID**: `get_by_channel_id(channel_id)`
+- **Channel Name**: `get_by_channel_name(&name)`
+
+See `ironrdp-svc/src/lib.rs:441-607`.
+
+### Processing SVC Traffic
+
+During the active session, route SVC data to the appropriate channel:
+
+```rust
+use ironrdp_pdu::mcs::SendDataIndication;
+use ironrdp_svc::StaticChannelSet;
+
+// Decode MCS Send Data Indication
+let mcs_pdu: SendDataIndication = decode(input)?;
+
+if let Some(channel) = static_channels.get_by_channel_id_mut(mcs_pdu.channel_id) {
+    // Process the payload (automatically de-chunkified)
+    let responses = channel.process(mcs_pdu.user_data.as_ref())?;
+    
+    // Encode and send responses
+    if !responses.is_empty() {
+        let encoded = ironrdp_svc::client_encode_svc_messages(
+            responses,
+            mcs_pdu.channel_id,
+            user_channel_id,
+        )?;
+        
+        stream.write_all(&encoded)?;
+    }
+}
+```
+
+Chunking and MCS/X.224/TPKT framing is handled automatically by `client_encode_svc_messages`.
+
+### Compression
+
+Specify compression behavior via `CompressionCondition`:
+
+```rust
+use ironrdp_svc::CompressionCondition;
+
+impl SvcProcessor for MyChannel {
+    fn compression_condition(&self) -> CompressionCondition {
+        // Never compress
+        CompressionCondition::Never
+        
+        // Compress only if RDP data compression is enabled
+        // CompressionCondition::WhenRdpDataIsCompressed
+        
+        // Always compress
+        // CompressionCondition::Always
+    }
+}
+```
+
+This sets the appropriate `ChannelOptions` flags in the Channel Definition:
+- `COMPRESS_RDP`: Compress if RDP data is compressed
+- `COMPRESS`: Always compress
+
+See `ironrdp-svc/src/lib.rs:123-132` and `make_channel_options` at line 426.
+
+### Example: Clipboard Channel
+
+The clipboard channel (CLIPRDR) demonstrates a complete SVC implementation:
+
+```rust
+// From ironrdp-cliprdr crate
+use ironrdp_cliprdr::CliprdrClient;
+
+let cliprdr = CliprdrClient::new();
+let connector = connector.with_static_channel(cliprdr);
+
+// Later, retrieve and use the channel
+if let Some(cliprdr) = static_channels
+    .get_by_type::<CliprdrClient>()
+    .and_then(|c| c.channel_processor_downcast_ref::<CliprdrClient>())
+{
+    // Interact with clipboard
+}
+```
+
+See `crates/ironrdp-cliprdr` for the full implementation.
+
+## Dynamic Virtual Channels (DVCs)
+
+Dynamic channels are created at runtime over the `DRDYNVC` static channel.
+
+### DRDYNVC Protocol
+
+The DRDYNVC channel manages dynamic channel lifecycle:
+
+1. **Create Request**: Client requests a new DVC by name
+2. **Create Response**: Server assigns a dynamic channel ID
+3. **Data**: Bidirectional data transfer using the channel ID
+4. **Close**: Either side closes the channel
+
+**PDU Types**:
+
+```rust
+pub enum DrdynvcDataPdu {
+    Create(CreateRequestPdu),
+    Data(DataPdu),
+    DataFirst(DataFirstPdu),
+    Close(ClosePdu),
+}
+```
+
+See `ironrdp-dvc/src/pdu.rs`.
+
+### Implementing a DVC
+
+Implement the `DvcProcessor` trait:
+
+```rust
+use ironrdp_dvc::{DvcProcessor, DvcMessage, encode_dvc_messages};
+use ironrdp_pdu::PduResult;
+use ironrdp_core::{impl_as_any, AsAny, Encode};
+
+#[derive(Debug)]
+struct MyDvc {
+    // Channel state
+}
+
+impl_as_any!(MyDvc);
+
+impl DvcProcessor for MyDvc {
+    fn channel_name(&self) -> &str {
+        "Vendor::MyDvc"
+    }
+    
+    fn start(&mut self, channel_id: u32) -> PduResult<Vec<DvcMessage>> {
+        // Called when DVC is opened
+        // channel_id assigned by server
+        Ok(vec![])
+    }
+    
+    fn process(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
+        // Process received data
+        let response = MyDvcResponse { /* ... */ };
+        Ok(vec![Box::new(response)])
+    }
+    
+    fn close(&mut self, channel_id: u32) {
+        // Channel closed by server
+    }
+}
+```
+
+See `ironrdp-dvc/src/lib.rs:40-59`.
+
+### DvcMessage and Encoding
+
+DVC messages are trait objects:
+
+```rust
+pub trait DvcEncode: Encode + Send {}
+pub type DvcMessage = Box<dyn DvcEncode>;
+```
+
+Implement `DvcEncode` for your response types:
+
+```rust
+struct MyDvcResponse {
+    data: Vec<u8>,
+}
+
+impl Encode for MyDvcResponse {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        dst.write_slice(&self.data);
+        Ok(())
+    }
+    
+    fn name(&self) -> &'static str { "MyDvcResponse" }
+    fn size(&self) -> usize { self.data.len() }
+}
+
+impl DvcEncode for MyDvcResponse {}
+```
+
+Return as `DvcMessage`:
+
+```rust
+Ok(vec![Box::new(response) as DvcMessage])
+```
+
+### Data Splitting
+
+Large DVC messages are automatically split:
+
+```rust
+pub const MAX_DATA_SIZE: usize = 1600;
+```
+
+First chunk uses `DataFirstPdu` with total length:
+
+```rust
+let pdu = if needs_splitting && first {
+    DrdynvcDataPdu::DataFirst(DataFirstPdu::new(
+        channel_id,
+        total_length,
+        chunk_data,
+    ))
+} else {
+    DrdynvcDataPdu::Data(DataPdu::new(channel_id, chunk_data))
+};
+```
+
+See `ironrdp-dvc/src/lib.rs:61-102`.
+
+### Client-Side DVC Management
+
+Use `DvcClient` to manage dynamic channels:
+
+```rust
+use ironrdp_dvc::DvcClient;
+
+let mut dvc_client = DvcClient::new();
+
+// Register DVC processors
+let my_dvc = MyDvc::new();
+dvc_client.register_processor(my_dvc);
+
+// Start DRDYNVC channel
+let messages = dvc_client.start()?;
+
+// Process DRDYNVC data
+let responses = dvc_client.process(&drdynvc_payload)?;
+```
+
+**Opening a channel:**
+
+```rust
+let create_messages = dvc_client.open_channel::<MyDvc>()?;
+// Send create_messages over DRDYNVC static channel
+```
+
+**Sending data:**
+
+```rust
+let data = MyDvcData { /* ... */ };
+let messages = dvc_client.send::<MyDvc>(vec![Box::new(data)])?;
+```
+
+**Closing a channel:**
+
+```rust
+let close_message = dvc_client.close_channel::<MyDvc>()?;
+```
+
+See `ironrdp-dvc/src/client.rs`.
+
+### Server-Side DVC Management
+
+Use `DvcServer` for server-side channel management:
+
+```rust
+use ironrdp_dvc::DvcServer;
+
+let mut dvc_server = DvcServer::new();
+
+// Register DVC handlers
+dvc_server.register_processor(Box::new(MyDvc::new()));
+
+// Process create request from client
+let responses = dvc_server.process_create_request(&create_request_pdu)?;
+
+// Process data
+let responses = dvc_server.process_data(&data_pdu)?;
+```
+
+See `ironrdp-dvc/src/server.rs`.
+
+### Example: Display Control (EGFX)
+
+The Enhanced Graphics Pipeline uses a DVC:
+
+```rust
+// Display Control channel
+use ironrdp_displaycontrol::DisplayControlClient;
+
+let display_control = DisplayControlClient::new();
+dvc_client.register_processor(display_control);
+
+// EGFX channel  
+use ironrdp_egfx::EgfxClient;
+
+let egfx = EgfxClient::new();
+dvc_client.register_processor(egfx);
+```
+
+See:
+- `crates/ironrdp-displaycontrol`
+- `crates/ironrdp-egfx`
+
+## Encoding and Sending
+
+### SVC Encoding
+
+Full encoding with MCS/X.224/TPKT headers:
+
+```rust
+use ironrdp_svc::client_encode_svc_messages;
+
+let messages: Vec<SvcMessage> = /* ... */;
+let encoded = client_encode_svc_messages(
+    messages,
+    channel_id,
+    user_channel_id,
+)?;
+
+stream.write_all(&encoded)?;
+```
+
+This function:
+1. Chunkifies messages into ~1600 byte chunks
+2. Adds `CHANNEL_PDU_HEADER` to each chunk
+3. Wraps in `MCS::SendDataRequest`
+4. Wraps in X.224 Data TPDU
+5. Adds TPKT header
+
+See `ironrdp-svc/src/lib.rs:230-256`.
+
+### DVC Encoding
+
+Wrap DVC messages in DRDYNVC PDUs, then encode as SVC:
+
+```rust
+use ironrdp_dvc::encode_dvc_messages;
+use ironrdp_svc::ChannelFlags;
+
+let dvc_messages: Vec<DvcMessage> = /* ... */;
+let svc_messages = encode_dvc_messages(
+    channel_id,
+    dvc_messages,
+    ChannelFlags::empty(),
+)?;
+
+// Then encode as SVC
+let encoded = client_encode_svc_messages(
+    svc_messages,
+    drdynvc_channel_id,
+    user_channel_id,
+)?;
+```
+
+See `ironrdp-dvc/src/lib.rs:61-102`.
+
+## Channel Lifecycle
+
+### SVC Lifecycle
+
+1. **Registration**: Call `with_static_channel()` before connection
+2. **Negotiation**: Channel included in Client Network Data GCC block
+3. **Assignment**: Server assigns channel ID in Server Network Data
+4. **Joining**: Client sends Channel Join Request (unless skipped)
+5. **Active**: `start()` called, bidirectional communication enabled
+6. **Termination**: Channel closes when session ends
+
+### DVC Lifecycle
+
+1. **Registration**: Register DVC processor with `DvcClient`
+2. **Creation**: Client sends Create Request over DRDYNVC
+3. **Assignment**: Server responds with Create Response containing channel ID
+4. **Active**: `start()` called, bidirectional communication enabled
+5. **Closure**: Either side sends Close PDU
+6. **Cleanup**: `close()` called, resources released
+
+## Built-in Channels
+
+IronRDP provides implementations for common channels:
+
+| Crate | Channel Name | Type | Description |
+|-------|--------------|------|-------------|
+| `ironrdp-cliprdr` | `CLIPRDR` | SVC | Clipboard redirection (MS-RDPECLIP) |
+| `ironrdp-rdpdr` | `RDPDR` | SVC | Device redirection (MS-RDPEFS) |
+| `ironrdp-rdpsnd` | `RDPSND` | SVC | Audio output (MS-RDPEA) |
+| `ironrdp-echo` | `ECHO` | SVC | Echo test channel |
+| `ironrdp-displaycontrol` | `Microsoft::Windows::RDS::DisplayControl` | DVC | Display configuration |
+| `ironrdp-egfx` | `Microsoft::Windows::RDS::Graphics` | DVC | Enhanced graphics pipeline |
+| `ironrdp-rdpeusb` | `URBDRC` | DVC | USB redirection |
+| `ironrdp-ainput` | `Microsoft::Windows::RDS::Input` | DVC | Advanced input |
+
+## Best Practices
+
+<Note>
+**Do:**
+- Implement proper error handling in `process()` methods
+- Return empty `Vec` when no responses are needed
+- Use meaningful channel names (8 bytes for SVC, descriptive for DVC)
+- Leverage automatic chunkification — don't manually split PDUs
+- Downcast channels safely using `channel_processor_downcast_ref()`
+
+**Don't:**
+- Block in `process()` or `start()` methods (no I/O)
+- Return `None` from `start()` unless explicitly intentional
+- Assume chunk size — use constants (`CHANNEL_CHUNK_LENGTH`, `MAX_DATA_SIZE`)
+- Forget to implement `AsAny` (use `impl_as_any!` macro)
+- Mix SVC and DVC encoding — they have different lifecycles
+</Note>
+
+## Debugging Channels
+
+Enable tracing to observe channel traffic:
+
+```rust
+use tracing::{debug, info, trace};
+use tracing_subscriber;
+
+tracing_subscriber::fmt::init();
+
+// In your SvcProcessor
+impl SvcProcessor for MyChannel {
+    fn process(&mut self, payload: &[u8]) -> PduResult<Vec<SvcMessage>> {
+        trace!(payload_len = payload.len(), "Received channel data");
+        // ...
+    }
+}
+```
+
+IronRDP uses structured logging throughout. See `STYLE.md` for logging conventions.
+
+## References
+
+- **SVC Implementation**: `crates/ironrdp-svc/src/lib.rs`
+- **DVC Implementation**: `crates/ironrdp-dvc/src/lib.rs`
+- **Clipboard Example**: `crates/ironrdp-cliprdr`
+- **Device Redirection**: `crates/ironrdp-rdpdr`  
+- **MS-RDPBCGR § 2.2.6**: Virtual Channel PDU structures
+- **MS-RDPEDYC**: Dynamic Virtual Channel Extension specification

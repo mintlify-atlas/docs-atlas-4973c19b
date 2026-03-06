@@ -1,0 +1,687 @@
+---
+title: ironrdp-server
+description: Extendable skeleton for implementing custom RDP servers
+---
+
+<Note>
+  **Community Maintained**: This crate is community-maintained and may have different stability guarantees than core IronRDP crates.
+</Note>
+
+## Overview
+
+`ironrdp-server` provides an extendable, high-level skeleton for implementing custom RDP servers. It handles connection acceptance, capability negotiation, display updates, input events, and virtual channels through simple trait-based interfaces.
+
+**Key Features:**
+- Complete RDP server implementation with minimal boilerplate
+- Type-safe builder pattern for configuration
+- Trait-based handlers for input and display
+- Support for static and dynamic virtual channels
+- Built-in support for clipboard, audio, and display control
+- Optional EGFX (Graphics Pipeline Extension) support
+- Deactivation-reactivation for dynamic resizing
+
+## Installation
+
+```toml
+[dependencies]
+ironrdp-server = "0.10"
+```
+
+### Features
+
+- **`default`**: Enables `rayon`, `qoi`, and `qoiz`
+- **`rayon`**: Parallel encoding with Rayon
+- **`qoi`**: QOI image codec support
+- **`qoiz`**: QOIZ compressed image codec support
+- **`egfx`**: Graphics Pipeline Extension (H.264 video streaming)
+- **`helper`**: TLS helper utilities for certificate loading
+
+## Quick Start
+
+```rust
+use ironrdp_server::{
+    RdpServer, RdpServerInputHandler, RdpServerDisplay, RdpServerDisplayUpdates,
+    KeyboardEvent, MouseEvent, DisplayUpdate, DesktopSize, BitmapUpdate,
+    Credentials, TlsIdentityCtx,
+};
+use std::net::SocketAddr;
+
+#[derive(Clone)]
+struct MyHandler;
+
+impl RdpServerInputHandler for MyHandler {
+    fn keyboard(&mut self, event: KeyboardEvent) {
+        println!("Key: {:?}", event);
+    }
+
+    fn mouse(&mut self, event: MouseEvent) {
+        println!("Mouse: {:?}", event);
+    }
+}
+
+#[async_trait::async_trait]
+impl RdpServerDisplay for MyHandler {
+    async fn size(&mut self) -> DesktopSize {
+        DesktopSize { width: 1920, height: 1080 }
+    }
+
+    async fn updates(&mut self) -> anyhow::Result<Box<dyn RdpServerDisplayUpdates>> {
+        // Return display update stream
+        Ok(Box::new(MyDisplayUpdates))
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let bind_addr: SocketAddr = "127.0.0.1:3389".parse()?;
+    let handler = MyHandler;
+
+    // Create TLS acceptor
+    let identity = TlsIdentityCtx::init_from_paths(
+        "cert.pem",
+        "key.pem",
+    )?;
+    let acceptor = identity.make_acceptor()?;
+
+    // Build server
+    let mut server = RdpServer::builder()
+        .with_addr(bind_addr)
+        .with_hybrid(acceptor, identity.pub_key)
+        .with_input_handler(handler.clone())
+        .with_display_handler(handler)
+        .build();
+
+    // Set credentials
+    server.set_credentials(Some(Credentials {
+        username: "admin".to_string(),
+        password: "password".to_string(),
+        domain: None,
+    }));
+
+    // Run server
+    server.run().await
+}
+```
+
+## Architecture
+
+### Builder Pattern
+
+The server uses a type-state builder pattern to ensure correct configuration:
+
+```rust
+RdpServer::builder()
+    .with_addr(addr)              // 1. Set bind address
+    .with_hybrid(acceptor, key)   // 2. Choose security
+    .with_input_handler(handler)  // 3. Set input handler
+    .with_display_handler(display)// 4. Set display handler
+    .with_cliprdr_factory(cliprdr)// 5. Optional: clipboard
+    .with_sound_factory(sound)    // 6. Optional: audio
+    .with_bitmap_codecs(codecs)   // 7. Optional: custom codecs
+    .build()                      // 8. Create server
+```
+
+### Security Options
+
+#### No Security (RDP)
+
+```rust
+RdpServer::builder()
+    .with_addr(addr)
+    .with_no_security()
+    // ...
+```
+
+#### TLS Only
+
+```rust
+use tokio_rustls::TlsAcceptor;
+
+let acceptor = make_tls_acceptor()?;
+
+RdpServer::builder()
+    .with_addr(addr)
+    .with_tls(acceptor)
+    // ...
+```
+
+#### Hybrid (CredSSP + TLS)
+
+```rust
+let identity = TlsIdentityCtx::init_from_paths("cert.pem", "key.pem")?;
+let acceptor = identity.make_acceptor()?;
+
+RdpServer::builder()
+    .with_addr(addr)
+    .with_hybrid(acceptor, identity.pub_key)
+    // ...
+```
+
+## Input Handling
+
+Implement `RdpServerInputHandler` to receive input events:
+
+```rust
+use ironrdp_server::{RdpServerInputHandler, KeyboardEvent, MouseEvent};
+
+struct InputHandler;
+
+impl RdpServerInputHandler for InputHandler {
+    fn keyboard(&mut self, event: KeyboardEvent) {
+        match event {
+            KeyboardEvent::Pressed { code, extended } => {
+                println!("Key pressed: {} (extended: {})", code, extended);
+            }
+            KeyboardEvent::Released { code, extended } => {
+                println!("Key released: {} (extended: {})", code, extended);
+            }
+            KeyboardEvent::UnicodePressed(char_code) => {
+                println!("Unicode pressed: U+{:04X}", char_code);
+            }
+            KeyboardEvent::UnicodeReleased(char_code) => {
+                println!("Unicode released: U+{:04X}", char_code);
+            }
+            KeyboardEvent::Synchronize(flags) => {
+                println!("Sync: {:?}", flags);
+            }
+        }
+    }
+
+    fn mouse(&mut self, event: MouseEvent) {
+        match event {
+            MouseEvent::Move { x, y } => {
+                println!("Mouse moved to ({}, {})", x, y);
+            }
+            MouseEvent::LeftPressed => println!("Left button pressed"),
+            MouseEvent::LeftReleased => println!("Left button released"),
+            MouseEvent::RightPressed => println!("Right button pressed"),
+            MouseEvent::RightReleased => println!("Right button released"),
+            MouseEvent::VerticalScroll { value } => {
+                println!("Vertical scroll: {}", value);
+            }
+            MouseEvent::RelMove { x, y } => {
+                println!("Relative move: ({}, {})", x, y);
+            }
+            _ => {}
+        }
+    }
+}
+```
+
+### Mouse Event Types
+
+The server supports multiple mouse input modes:
+
+- **Absolute positioning**: `MouseEvent::Move { x, y }`
+- **Relative movement**: `MouseEvent::RelMove { x, y }`
+- **Button events**: `LeftPressed`, `RightPressed`, `MiddlePressed`, `Button4/5Pressed`
+- **Scroll events**: `VerticalScroll { value }`, `Scroll { x, y }`
+
+## Display Management
+
+### Display Handler
+
+Implement `RdpServerDisplay` to provide display updates:
+
+```rust
+use ironrdp_server::{
+    RdpServerDisplay, RdpServerDisplayUpdates, 
+    DisplayUpdate, DesktopSize, BitmapUpdate,
+    PixelFormat,
+};
+use tokio::sync::mpsc;
+
+struct DisplayHandler {
+    width: u16,
+    height: u16,
+    update_tx: mpsc::UnboundedSender<DisplayUpdate>,
+}
+
+#[async_trait::async_trait]
+impl RdpServerDisplay for DisplayHandler {
+    async fn size(&mut self) -> DesktopSize {
+        DesktopSize {
+            width: self.width,
+            height: self.height,
+        }
+    }
+
+    async fn updates(&mut self) -> anyhow::Result<Box<dyn RdpServerDisplayUpdates>> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.update_tx = tx;
+        Ok(Box::new(DisplayUpdateStream { rx }))
+    }
+}
+
+struct DisplayUpdateStream {
+    rx: mpsc::UnboundedReceiver<DisplayUpdate>,
+}
+
+#[async_trait::async_trait]
+impl RdpServerDisplayUpdates for DisplayUpdateStream {
+    async fn next_update(&mut self) -> anyhow::Result<Option<DisplayUpdate>> {
+        Ok(self.rx.recv().await)
+    }
+}
+```
+
+### Sending Bitmap Updates
+
+```rust
+use ironrdp_server::{BitmapUpdate, DisplayUpdate, PixelFormat};
+use core::num::{NonZeroU16, NonZeroUsize};
+
+// Generate or capture pixel data
+let width = NonZeroU16::new(640).unwrap();
+let height = NonZeroU16::new(480).unwrap();
+let stride = NonZeroUsize::new(640 * 4).unwrap();
+let data: Vec<u8> = generate_pixels(); // BgrA32 format
+
+let update = DisplayUpdate::Bitmap(BitmapUpdate {
+    x: 0,
+    y: 0,
+    width,
+    height,
+    format: PixelFormat::BgrA32,
+    data: data.into(),
+    stride,
+});
+
+// Send through channel
+update_tx.send(update)?;
+```
+
+### Supported Pixel Formats
+
+- **BgrA32**: 32-bit BGRA (recommended)
+- **ABgr32**: 32-bit ABGR
+- **RgbA32**: 32-bit RGBA
+- **ARgb32**: 32-bit ARGB
+- **Bgr24**: 24-bit BGR
+- **Rgb24**: 24-bit RGB
+- **Bgr16**: 16-bit BGR565
+- **Rgb16**: 16-bit RGB565
+
+### Display Updates
+
+Supported update types:
+
+```rust
+pub enum DisplayUpdate {
+    Resize(DesktopSize),
+    Bitmap(BitmapUpdate),
+    PointerPosition(PointerPositionAttribute),
+    ColorPointer(ColorPointer),
+    RGBAPointer(RGBAPointer),
+    HidePointer,
+    DefaultPointer,
+    CachedPointer(u16),
+}
+```
+
+#### Dynamic Resizing
+
+```rust
+let resize = DisplayUpdate::Resize(DesktopSize {
+    width: 2560,
+    height: 1440,
+});
+update_tx.send(resize)?;
+```
+
+The server automatically handles deactivation-reactivation sequences.
+
+#### Custom Pointers
+
+```rust
+let pointer = DisplayUpdate::RGBAPointer(RGBAPointer {
+    cache_index: 0,
+    width: 32,
+    height: 32,
+    hot_x: 16,
+    hot_y: 16,
+    data: rgba_data,
+});
+update_tx.send(pointer)?;
+
+// Later, use the cached pointer
+let cached = DisplayUpdate::CachedPointer(0);
+update_tx.send(cached)?;
+```
+
+## Bitmap Encoding
+
+The server supports multiple bitmap codecs:
+
+### Built-in Codecs
+
+```rust
+use ironrdp_pdu::rdp::capability_sets::{server_codecs_capabilities, CodecId};
+
+let codecs = server_codecs_capabilities(&[
+    CodecId::RemoteFx,  // RemoteFX
+    CodecId::Qoi,       // QOI (requires "qoi" feature)
+    CodecId::QoiZ,      // QOIZ (requires "qoiz" feature)
+])?;
+
+RdpServer::builder()
+    // ...
+    .with_bitmap_codecs(codecs)
+    .build()
+```
+
+### Codec Selection
+
+- **RemoteFX**: Hardware-accelerated codec, efficient for large updates
+- **RDP 6.0**: Standard compression (always available)
+- **QOI**: Fast lossless codec (requires `qoi` feature)
+- **QOIZ**: Compressed QOI (requires `qoiz` feature)
+
+### Encoder Configuration
+
+```rust
+use ironrdp_server::RdpServerOptions;
+
+RdpServer::builder()
+    // ...
+    .with_max_request_size(8 * 1024 * 1024)  // 8 MB max reassembly buffer
+    .build()
+```
+
+The `max_request_size` controls the maximum size of fragmented updates. Default is 8 MB. Values too large may cause clients to reject connections.
+
+## Virtual Channels
+
+### Clipboard Support
+
+```rust
+use ironrdp_server::CliprdrServerFactory;
+use ironrdp_cliprdr::backend::{CliprdrBackend, CliprdrBackendFactory};
+
+struct MyCliprdrFactory;
+
+impl CliprdrBackendFactory for MyCliprdrFactory {
+    fn build_cliprdr_backend(&self) -> Box<dyn CliprdrBackend> {
+        Box::new(MyCliprdrBackend::new())
+    }
+}
+
+impl CliprdrServerFactory for MyCliprdrFactory {}
+
+RdpServer::builder()
+    // ...
+    .with_cliprdr_factory(Some(Box::new(MyCliprdrFactory)))
+    .build()
+```
+
+See the [server example](https://github.com/Devolutions/IronRDP/blob/master/crates/ironrdp/examples/server.rs) for a complete stub implementation.
+
+### Audio Support
+
+```rust
+use ironrdp_server::SoundServerFactory;
+use ironrdp_rdpsnd::server::{RdpsndServerHandler, RdpsndServerMessage};
+use ironrdp_rdpsnd::pdu::{AudioFormat, WaveFormat};
+
+struct MyAudioHandler;
+
+impl RdpsndServerHandler for MyAudioHandler {
+    fn get_formats(&self) -> &[AudioFormat] {
+        &[
+            AudioFormat {
+                format: WaveFormat::PCM,
+                n_channels: 2,
+                n_samples_per_sec: 44100,
+                n_avg_bytes_per_sec: 176400,
+                n_block_align: 4,
+                bits_per_sample: 16,
+                data: None,
+            },
+        ]
+    }
+
+    fn start(&mut self, client_format: &ClientAudioFormatPdu) -> Option<u16> {
+        // Choose format index, start audio streaming
+        Some(0)
+    }
+
+    fn stop(&mut self) {
+        // Stop audio streaming
+    }
+}
+
+struct MyAudioFactory;
+
+impl SoundServerFactory for MyAudioFactory {
+    fn build_backend(&self) -> Box<dyn RdpsndServerHandler> {
+        Box::new(MyAudioHandler)
+    }
+}
+
+RdpServer::builder()
+    // ...
+    .with_sound_factory(Some(Box::new(MyAudioFactory)))
+    .build()
+```
+
+#### Sending Audio Data
+
+```rust
+use ironrdp_server::{ServerEvent, RdpsndServerMessage};
+
+// Get event sender from factory
+let event_tx: mpsc::UnboundedSender<ServerEvent>;
+
+// Generate audio samples (PCM)
+let samples: Vec<u8> = generate_audio();
+
+// Send wave data with timestamp
+let timestamp = 0u16;  // Increment by ~100ms for each packet
+event_tx.send(ServerEvent::Rdpsnd(
+    RdpsndServerMessage::Wave(samples, timestamp)
+))?;
+```
+
+### Display Control
+
+The server automatically supports the Display Control channel (`MS-RDPEDISP`) for dynamic resolution changes initiated by the client:
+
+```rust
+use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
+
+#[async_trait::async_trait]
+impl RdpServerDisplay for MyDisplay {
+    // ...
+
+    fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
+        // Client requested resolution change
+        for monitor in layout.monitors {
+            println!("Monitor: {}x{} at ({}, {})",
+                monitor.width, monitor.height,
+                monitor.left, monitor.top);
+        }
+        
+        // Adjust display and send resize update
+    }
+}
+```
+
+### EGFX (Graphics Pipeline Extension)
+
+<Warning>
+  EGFX support is experimental and requires the `egfx` feature flag.
+</Warning>
+
+```rust
+#[cfg(feature = "egfx")]
+use ironrdp_server::GfxServerFactory;
+
+#[cfg(feature = "egfx")]
+RdpServer::builder()
+    // ...
+    .with_gfx_factory(Some(Box::new(MyGfxFactory)))
+    .build()
+```
+
+EGFX enables H.264 video streaming for efficient remote desktop scenarios.
+
+## Echo Channel (RTT Measurement)
+
+Measure round-trip time using the ECHO dynamic virtual channel:
+
+```rust
+use ironrdp_server::RdpServer;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let mut server = RdpServer::builder()
+        // ... configure server
+        .build();
+
+    // Get echo handle before moving server
+    let echo = server.echo_handle().clone();
+
+    // Spawn server task
+    let server_task = tokio::spawn(async move {
+        server.run().await
+    });
+
+    // Send echo request
+    echo.send_request(b"ping".to_vec())?;
+
+    // Check measurements
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    for measurement in echo.take_measurements() {
+        println!("RTT: {:?}", measurement.round_trip_time);
+    }
+
+    server_task.await??;
+    Ok(())
+}
+```
+
+The echo handle can be cloned and used from any task. Requests are queued if the client hasn't opened the ECHO channel yet.
+
+## Complete Example
+
+See the [server example](https://github.com/Devolutions/IronRDP/blob/master/crates/ironrdp/examples/server.rs) in the IronRDP repository for a complete working server implementation including:
+
+- Random bitmap generation
+- Stub clipboard implementation  
+- Audio synthesis (sine wave)
+- TLS configuration
+- Credential validation
+- Full input handling
+
+```bash
+# Run the example
+cargo run --example=server -- \
+  --bind-addr 127.0.0.1:3389 \
+  --cert cert.pem \
+  --key key.pem \
+  --user admin \
+  --pass password \
+  --sec hybrid
+```
+
+## Configuration Options
+
+### RdpServerOptions
+
+```rust
+pub struct RdpServerOptions {
+    pub addr: SocketAddr,
+    pub security: RdpServerSecurity,
+    pub codecs: BitmapCodecs,
+    pub max_request_size: u32,
+}
+```
+
+### Credentials
+
+```rust
+server.set_credentials(Some(Credentials {
+    username: "admin".to_string(),
+    password: "secret".to_string(),
+    domain: Some("CONTOSO".to_string()),
+}));
+```
+
+If credentials are set, the server validates client credentials during CredSSP or in the Client Info PDU.
+
+## TLS Helper (Feature: `helper`)
+
+Convenience utilities for TLS certificate handling:
+
+```rust
+use ironrdp_server::TlsIdentityCtx;
+
+// Load from PEM files
+let identity = TlsIdentityCtx::init_from_paths(
+    "path/to/cert.pem",
+    "path/to/key.pem",
+)?;
+
+// Access public key for CredSSP
+let pub_key = identity.pub_key;
+
+// Create TLS acceptor
+let acceptor = identity.make_acceptor()?;
+```
+
+## Thread Safety
+
+Handler traits require `Send` but not `Sync`:
+
+```rust
+pub trait RdpServerInputHandler: Send {
+    fn keyboard(&mut self, event: KeyboardEvent);
+    fn mouse(&mut self, event: MouseEvent);
+}
+```
+
+The server internally uses `Arc<Mutex<>>` for shared state. Blocking operations in handlers are spawned to `tokio::task::spawn_blocking`:
+
+```rust
+impl RdpServerInputHandler for MyHandler {
+    fn keyboard(&mut self, event: KeyboardEvent) {
+        // This is called from blocking context, safe to block
+        expensive_operation();
+    }
+}
+```
+
+## Performance Considerations
+
+### Encoding Performance
+
+- Enable `rayon` feature for parallel encoding (default)
+- Use RemoteFX or QOI for better compression
+- Adjust `max_request_size` based on network conditions
+
+### Display Updates
+
+- Send updates at reasonable rates (30-60 FPS max)
+- Use sub-region updates when possible
+- Consider framebuffer diffing to send only changes
+
+### Memory Usage
+
+- Bitmap updates hold pixel data in `Bytes` (reference-counted)
+- The server maintains a framebuffer for differencing
+- Audio buffers are transient
+
+## Related Crates
+
+- [`ironrdp-acceptor`](/api/ironrdp-acceptor) - Low-level connection acceptance
+- [`ironrdp-pdu`](/api/ironrdp-pdu) - RDP PDU encoding/decoding
+- [`ironrdp-graphics`](/api/ironrdp-graphics) - Image processing and codecs
+- [`ironrdp-cliprdr`](/api/ironrdp-cliprdr) - Clipboard redirection
+- [`ironrdp-rdpsnd`](/api/ironrdp-rdpsnd) - Audio redirection
+- [`ironrdp-displaycontrol`](/api/ironrdp-displaycontrol) - Display control channel
+- [`ironrdp-egfx`](/api/ironrdp-egfx) - Graphics pipeline extension
+
+## See Also
+
+- [Server Example](https://github.com/Devolutions/IronRDP/blob/master/crates/ironrdp/examples/server.rs) - Complete working server
+- [RDP Server Architecture](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/) - Microsoft documentation

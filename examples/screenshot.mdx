@@ -1,0 +1,347 @@
+---
+title: Screenshot Example
+description: Build a simple RDP client that captures remote desktop screenshots
+---
+
+The screenshot example demonstrates how to build a basic RDP client using IronRDP in a blocking, synchronous manner. It connects to an RDP server, receives graphics updates, and saves the resulting image to disk.
+
+## Overview
+
+**Location:** `crates/ironrdp/examples/screenshot.rs`
+
+**Purpose:** Demonstrate basic RDP client implementation with minimal code
+
+**Key Features:**
+- Blocking I/O using `ironrdp-blocking`
+- TLS upgrade with custom certificate verification
+- Graphics decoding and image processing
+- Configurable compression settings
+- PNG image output
+
+## Usage
+
+### Basic Usage
+
+```bash
+cargo run --example screenshot -- \
+  --host <HOSTNAME> \
+  -u <USERNAME> \
+  -p <PASSWORD> \
+  -o out.png
+```
+
+### With Compression
+
+```bash
+# Enable compression at level 3 (RDP 6.1)
+cargo run --example screenshot -- \
+  --host 10.0.0.100 \
+  -u Administrator \
+  -p MyPassword \
+  --compression-enabled true \
+  --compression-level 3 \
+  -o screenshot.png
+```
+
+### With Logging
+
+```bash
+IRONRDP_LOG=info cargo run --example screenshot -- \
+  --host example.com \
+  -u user \
+  -p pass \
+  -o output.png
+```
+
+## Command-Line Arguments
+
+| Argument | Short | Required | Default | Description |
+|----------|-------|----------|---------|-------------|
+| `--host` | - | Yes | - | RDP server hostname or IP address |
+| `--port` | - | No | 3389 | RDP server port |
+| `--username` | `-u` | Yes | - | Username for authentication |
+| `--password` | `-p` | Yes | - | Password for authentication |
+| `--output` | `-o` | No | out.png | Output PNG file path |
+| `--domain` | `-d` | No | - | Domain for authentication |
+| `--compression-enabled` | - | No | true | Enable/disable compression |
+| `--compression-level` | - | No | 3 | Compression level (0-3) |
+
+## Code Walkthrough
+
+### 1. Argument Parsing
+
+```rust
+fn parse_args() -> anyhow::Result<Action> {
+    let mut args = pico_args::Arguments::from_env();
+    
+    let host = args.value_from_str("--host")?;
+    let port = args.opt_value_from_str("--port")?.unwrap_or(3389);
+    let username = args.value_from_str(["- u", "--username"])?;
+    let password = args.value_from_str(["-p", "--password"])?;
+    let output = args.opt_value_from_str(["-o", "--output"])?
+        .unwrap_or_else(|| PathBuf::from("out.png"));
+    let compression_level = args.opt_value_from_str("--compression-level")?
+        .unwrap_or(3);
+    
+    // ... construct Action
+}
+```
+
+See: `screenshot.rs:123`
+
+### 2. Configuration
+
+```rust
+fn build_config(
+    username: String,
+    password: String,
+    domain: Option<String>,
+    compression_enabled: bool,
+    compression_level: u32,
+) -> anyhow::Result<connector::Config> {
+    let compression_type = if compression_enabled {
+        Some(compression_type_from_level(compression_level)?)
+    } else {
+        None
+    };
+    
+    Ok(connector::Config {
+        credentials: Credentials::UsernamePassword { username, password },
+        domain,
+        desktop_size: connector::DesktopSize {
+            width: 1280,
+            height: 1024,
+        },
+        compression_type,
+        // ... other fields
+    })
+}
+```
+
+See: `screenshot.rs:209`
+
+### 3. Connection Establishment
+
+```rust
+fn connect(
+    config: connector::Config,
+    server_name: String,
+    port: u16,
+) -> anyhow::Result<(ConnectionResult, UpgradedFramed)> {
+    // Resolve server address
+    let server_addr = lookup_addr(&server_name, port)?;
+    
+    // Establish TCP connection
+    let tcp_stream = TcpStream::connect(server_addr)?;
+    tcp_stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    
+    let mut framed = ironrdp_blocking::Framed::new(tcp_stream);
+    let mut connector = connector::ClientConnector::new(config, client_addr);
+    
+    // Begin connection sequence
+    let should_upgrade = ironrdp_blocking::connect_begin(&mut framed, &mut connector)?;
+    
+    // TLS upgrade
+    let initial_stream = framed.into_inner_no_leftover();
+    let (upgraded_stream, server_public_key) = tls_upgrade(initial_stream, server_name)?;
+    let upgraded = ironrdp_blocking::mark_as_upgraded(should_upgrade, &mut connector);
+    
+    // Finalize connection
+    let mut upgraded_framed = ironrdp_blocking::Framed::new(upgraded_stream);
+    let connection_result = ironrdp_blocking::connect_finalize(
+        upgraded,
+        connector,
+        &mut upgraded_framed,
+        &mut network_client,
+        server_name.into(),
+        server_public_key,
+        None,
+    )?;
+    
+    Ok((connection_result, upgraded_framed))
+}
+```
+
+See: `screenshot.rs:290`
+
+### 4. TLS Upgrade
+
+```rust
+fn tls_upgrade(
+    stream: TcpStream,
+    server_name: String,
+) -> anyhow::Result<(rustls::StreamOwned<rustls::ClientConnection, TcpStream>, Vec<u8>)> {
+    let mut config = rustls::client::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(
+            std::sync::Arc::new(danger::NoCertificateVerification)
+        )
+        .with_no_client_auth();
+    
+    // Enable SSLKEYLOGFILE for Wireshark debugging
+    config.key_log = std::sync::Arc::new(rustls::KeyLogFile::new());
+    
+    // Disable TLS resumption (required for CredSSP)
+    config.resumption = rustls::client::Resumption::disabled();
+    
+    let client = rustls::ClientConnection::new(
+        std::sync::Arc::new(config),
+        server_name.try_into()?
+    )?;
+    
+    let mut tls_stream = rustls::StreamOwned::new(client, stream);
+    tls_stream.flush()?; // Complete TLS handshake
+    
+    // Extract server public key
+    let cert = tls_stream.conn.peer_certificates()
+        .and_then(|certs| certs.first())
+        .context("peer certificate is missing")?;
+    let server_public_key = extract_tls_server_public_key(cert)?;
+    
+    Ok((tls_stream, server_public_key))
+}
+```
+
+See: `screenshot.rs:381`
+
+### 5. Active Stage Processing
+
+```rust
+fn active_stage(
+    connection_result: ConnectionResult,
+    mut framed: UpgradedFramed,
+    image: &mut DecodedImage,
+) -> anyhow::Result<()> {
+    let mut active_stage = ActiveStage::new(connection_result);
+    
+    'outer: loop {
+        // Read PDU from server
+        let (action, payload) = match framed.read_pdu() {
+            Ok((action, payload)) => (action, payload),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break 'outer,
+            Err(e) => return Err(anyhow::Error::new(e)),
+        };
+        
+        // Process PDU and handle outputs
+        let outputs = active_stage.process(image, action, &payload)?;
+        
+        for out in outputs {
+            match out {
+                ActiveStageOutput::ResponseFrame(frame) => {
+                    framed.write_all(&frame)?;
+                }
+                ActiveStageOutput::Terminate(_) => break 'outer,
+                _ => {}
+            }
+        }
+    }
+    
+    Ok(())
+}
+```
+
+See: `screenshot.rs:342`
+
+### 6. Image Output
+
+```rust
+fn run(config: RunConfig) -> anyhow::Result<()> {
+    let (connection_result, framed) = connect(/* ... */)?;
+    
+    // Create image buffer
+    let mut image = DecodedImage::new(
+        ironrdp_graphics::image_processing::PixelFormat::RgbA32,
+        connection_result.desktop_size.width,
+        connection_result.desktop_size.height,
+    );
+    
+    // Process graphics updates
+    active_stage(connection_result, framed, &mut image)?;
+    
+    // Save as PNG
+    let img: image::ImageBuffer<image::Rgba<u8>, _> = 
+        image::ImageBuffer::from_raw(
+            u32::from(image.width()),
+            u32::from(image.height()),
+            image.data()
+        ).context("invalid image")?;
+    
+    img.save(config.output)?;
+    
+    Ok(())
+}
+```
+
+See: `screenshot.rs:180`
+
+## Compression Levels
+
+Compression levels map to RDP compression types:
+
+```rust
+fn compression_type_from_level(level: u32) -> anyhow::Result<CompressionType> {
+    match level {
+        0 => Ok(CompressionType::K8),    // RDP 4.0
+        1 => Ok(CompressionType::K64),   // RDP 5.0
+        2 => Ok(CompressionType::Rdp6),  // RDP 6.0
+        3 => Ok(CompressionType::Rdp61), // RDP 6.1 (best)
+        _ => Err(anyhow::anyhow!("Invalid compression level")),
+    }
+}
+```
+
+See: `screenshot.rs:278`
+
+## Certificate Verification
+
+The example uses a custom certificate verifier for testing purposes:
+
+```rust
+mod danger {
+    #[derive(Debug)]
+    pub(super) struct NoCertificateVerification;
+    
+    impl ServerCertVerifier for NoCertificateVerification {
+        fn verify_server_cert(/* ... */) -> Result<ServerCertVerified, Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+        
+        fn verify_tls12_signature(/* ... */) -> Result<HandshakeSignatureValid, Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        
+        fn verify_tls13_signature(/* ... */) -> Result<HandshakeSignatureValid, Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![/* all schemes */]
+        }
+    }
+}
+```
+
+<Warning>
+This certificate verifier accepts ALL certificates without validation. Only use this for testing! Production code should implement proper certificate validation.
+</Warning>
+
+See: `screenshot.rs:441`
+
+## Key Takeaways
+
+1. **Blocking I/O**: Uses standard library `TcpStream` and `ironrdp-blocking` for simple synchronous operation
+2. **State Machine**: Connection follows a clear state machine pattern (begin → upgrade → finalize)
+3. **Graphics Processing**: Uses `DecodedImage` to accumulate graphics updates
+4. **Error Handling**: Leverages `anyhow` for convenient error propagation
+5. **Timeout Handling**: Uses `WouldBlock` error to exit the processing loop cleanly
+
+## Related Examples
+
+- [Server Example](/examples/server) - Complete RDP server implementation
+- [Examples Overview](/examples/overview) - All available examples
+
+## Further Reading
+
+- [ironrdp-blocking API](/api/ironrdp-blocking)
+- [ironrdp-connector API](/api/ironrdp-connector)
+- [ironrdp-session API](/api/ironrdp-session)

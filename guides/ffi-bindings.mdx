@@ -1,0 +1,495 @@
+---
+title: FFI Bindings
+description: Use IronRDP from other languages via FFI bindings
+---
+
+IronRDP provides Foreign Function Interface (FFI) bindings using [Diplomat](https://github.com/rust-diplomat/diplomat), enabling usage from languages like C#, C++, and others. Currently, .NET is the officially supported target.
+
+## Overview
+
+The FFI layer (`ffi/` directory) exposes core IronRDP functionality:
+
+- Connection management
+- Session handling
+- Graphics processing
+- Input events
+- Clipboard operations
+- Virtual channels (DVC)
+- CredSSP authentication
+
+## Building FFI Bindings
+
+<Steps>
+
+### Install required tools
+
+```shell
+cargo xtask ffi install
+```
+
+For .NET bindings, you also need the .NET SDK:
+
+```shell
+# Ubuntu/Debian
+sudo apt install dotnet-sdk-8.0
+
+# macOS
+brew install dotnet
+
+# Windows
+winget install Microsoft.DotNet.SDK.8
+```
+
+### Build the shared library
+
+```shell
+# Debug build
+cargo xtask ffi build
+
+# Release build (recommended for production)
+cargo xtask ffi build --release
+```
+
+This creates:
+- **Linux**: `libironrdp_ffi.so`
+- **macOS**: `libironrdp_ffi.dylib`
+- **Windows**: `ironrdp_ffi.dll`
+
+### Generate language bindings
+
+```shell
+cargo xtask ffi bindings
+```
+
+This generates C# bindings in `ffi/dotnet/Devolutions.IronRdp/Generated/`.
+
+### Build .NET package
+
+```shell
+cd ffi/dotnet
+dotnet build
+```
+
+</Steps>
+
+## Using .NET Bindings
+
+### Basic Connection Example
+
+Here's a complete .NET example:
+
+```csharp
+using Devolutions.IronRdp;
+using Devolutions.IronRdp.Connector;
+
+class Program
+{
+    static async Task Main(string[] args)
+    {
+        // Configure connection
+        var config = new ConnectorConfig
+        {
+            Username = "user",
+            Password = "password",
+            Domain = null,
+            ServerAddr = "server.example.com:3389",
+            DesktopWidth = 1920,
+            DesktopHeight = 1080,
+            EnableTls = true,
+            EnableCredssp = true,
+        };
+
+        // Create connector
+        using var connector = new RdpConnector(config);
+
+        // Establish connection
+        var result = await connector.ConnectAsync();
+        Console.WriteLine($"Connected! Desktop: {result.DesktopWidth}x{result.DesktopHeight}");
+
+        // Process session
+        await ProcessSessionAsync(connector, result);
+    }
+
+    static async Task ProcessSessionAsync(RdpConnector connector, ConnectionResult result)
+    {
+        var session = new ActiveSession(result);
+        var image = new DecodedImage(result.DesktopWidth, result.DesktopHeight);
+
+        while (true)
+        {
+            var pdu = await connector.ReadPduAsync();
+            var outputs = session.Process(image, pdu);
+
+            foreach (var output in outputs)
+            {
+                switch (output.Type)
+                {
+                    case OutputType.GraphicsUpdate:
+                        // Image has been updated
+                        RenderImage(image);
+                        break;
+
+                    case OutputType.ResponseFrame:
+                        await connector.WriteAsync(output.Data);
+                        break;
+
+                    case OutputType.Terminate:
+                        Console.WriteLine("Session terminated");
+                        return;
+                }
+            }
+        }
+    }
+
+    static void RenderImage(DecodedImage image)
+    {
+        var pixels = image.GetPixels();
+        // Render to screen, save to file, etc.
+    }
+}
+```
+
+### Sending Input Events
+
+```csharp
+using Devolutions.IronRdp.Input;
+
+// Send keyboard event
+var keyEvent = new KeyboardEvent
+{
+    KeyCode = 0x1E, // 'A' key
+    Flags = KeyboardFlags.Down,
+};
+connector.SendInput(keyEvent);
+
+// Send mouse event
+var mouseEvent = new MouseEvent
+{
+    X = 100,
+    Y = 200,
+    Flags = MouseFlags.Move,
+};
+connector.SendInput(mouseEvent);
+
+// Send mouse click
+var clickEvent = new MouseEvent
+{
+    X = 100,
+    Y = 200,
+    Flags = MouseFlags.LeftButton | MouseFlags.Down,
+};
+connector.SendInput(clickEvent);
+```
+
+### Clipboard Operations
+
+```csharp
+using Devolutions.IronRdp.Clipboard;
+
+// Create clipboard backend
+var clipboard = new CliprdrBackend();
+
+// Handle clipboard updates
+clipboard.OnFormatList += (sender, formats) =>
+{
+    Console.WriteLine("Available clipboard formats:");
+    foreach (var format in formats)
+    {
+        Console.WriteLine($"  - {format.Name} (ID: {format.Id})");
+    }
+};
+
+// Request clipboard data
+var data = await clipboard.RequestDataAsync(ClipboardFormat.Text);
+var text = System.Text.Encoding.UTF8.GetString(data);
+Console.WriteLine($"Clipboard text: {text}");
+
+// Set clipboard data
+var newText = "Hello from IronRDP!";
+var bytes = System.Text.Encoding.UTF8.GetBytes(newText);
+await clipboard.SetDataAsync(ClipboardFormat.Text, bytes);
+```
+
+### Graphics Rendering to Bitmap
+
+```csharp
+using System.Drawing;
+using System.Drawing.Imaging;
+
+static void SaveScreenshot(DecodedImage image, string path)
+{
+    var width = image.Width;
+    var height = image.Height;
+    var pixels = image.GetPixels();
+
+    using var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);
+    var bitmapData = bitmap.LockBits(
+        new Rectangle(0, 0, width, height),
+        ImageLockMode.WriteOnly,
+        PixelFormat.Format32bppArgb
+    );
+
+    System.Runtime.InteropServices.Marshal.Copy(
+        pixels,
+        0,
+        bitmapData.Scan0,
+        pixels.Length
+    );
+
+    bitmap.UnlockBits(bitmapData);
+    bitmap.Save(path, ImageFormat.Png);
+}
+
+// Usage
+SaveScreenshot(image, "screenshot.png");
+```
+
+### Error Handling
+
+```csharp
+using Devolutions.IronRdp;
+
+try
+{
+    var result = await connector.ConnectAsync();
+}
+catch (IronRdpException ex)
+{
+    switch (ex.Kind)
+    {
+        case ErrorKind.Authentication:
+            Console.WriteLine("Authentication failed: " + ex.Message);
+            break;
+
+        case ErrorKind.Network:
+            Console.WriteLine("Network error: " + ex.Message);
+            break;
+
+        case ErrorKind.Protocol:
+            Console.WriteLine("Protocol error: " + ex.Message);
+            break;
+
+        default:
+            Console.WriteLine("Error: " + ex.Message);
+            break;
+    }
+}
+```
+
+## Running .NET Examples
+
+### Console Example
+
+```shell
+cd ffi/dotnet
+dotnet run --project Devolutions.IronRdp.ConnectExample -- \
+    --host server.example.com \
+    --username user \
+    --password pass
+```
+
+### Avalonia GUI Example
+
+The FFI directory includes a full GUI example using Avalonia:
+
+```shell
+cd ffi/dotnet
+dotnet run --project Devolutions.IronRdp.AvaloniaExample
+```
+
+This demonstrates:
+- Window management
+- Graphics rendering
+- Input handling
+- Full RDP client UI
+
+## Advanced Usage
+
+### Custom TLS Configuration
+
+```csharp
+var config = new ConnectorConfig
+{
+    // ... other settings
+    EnableTls = true,
+    TlsOptions = new TlsOptions
+    {
+        AcceptInvalidCertificates = false,
+        CertificatePath = "path/to/cert.pem",
+    },
+};
+```
+
+### Dynamic Virtual Channels
+
+```csharp
+using Devolutions.IronRdp.Dvc;
+
+// Implement custom DVC
+class MyDvcChannel : IDvcProcessor
+{
+    public string ChannelName => "my.custom.dvc";
+
+    public void OnStart(uint channelId)
+    {
+        Console.WriteLine($"DVC started: {channelId}");
+    }
+
+    public byte[] OnData(byte[] data)
+    {
+        // Process incoming data
+        Console.WriteLine($"Received {data.Length} bytes");
+
+        // Return response
+        return Array.Empty<byte>();
+    }
+
+    public void OnClose()
+    {
+        Console.WriteLine("DVC closed");
+    }
+}
+
+// Register DVC
+var dvc = new MyDvcChannel();
+connector.RegisterDvc(dvc);
+```
+
+### RDCleanPath Parsing
+
+```csharp
+using Devolutions.IronRdp;
+
+// Parse RDCleanPath from URL parameters
+var cleanPath = RdCleanPath.Parse("base64-encoded-data");
+
+Console.WriteLine($"Protocol: {cleanPath.Protocol}");
+Console.WriteLine($"Host: {cleanPath.Host}");
+Console.WriteLine($"Port: {cleanPath.Port}");
+```
+
+## Building for Other Languages
+
+While .NET is officially supported, Diplomat can generate bindings for:
+
+- **C/C++** - Generate header files
+- **JavaScript** - Via WebAssembly (see [WebAssembly guide](/guides/webassembly))
+- **Python** - Community-contributed bindings
+
+### Generating C Headers
+
+```shell
+# Modify ffi/build.rs to enable C backend
+cargo build -p ironrdp-ffi
+```
+
+This generates C header files in `target/diplomat/`.
+
+## Memory Management
+
+### .NET Resource Disposal
+
+Always dispose IronRDP objects:
+
+```csharp
+using (var connector = new RdpConnector(config))
+using (var session = new ActiveSession(result))
+using (var image = new DecodedImage(width, height))
+{
+    // Use resources
+}
+// Automatically disposed
+```
+
+Or use explicit disposal:
+
+```csharp
+var connector = new RdpConnector(config);
+try
+{
+    // Use connector
+}
+finally
+{
+    connector.Dispose();
+}
+```
+
+## Troubleshooting
+
+### Library Not Found
+
+Ensure the native library is in the correct location:
+
+```csharp
+// Set library path explicitly (if needed)
+Environment.SetEnvironmentVariable(
+    "LD_LIBRARY_PATH",
+    "/path/to/ironrdp/target/release"
+);
+```
+
+### Version Mismatch
+
+Regenerate bindings after updating IronRDP:
+
+```shell
+cargo xtask ffi build --release
+cargo xtask ffi bindings
+cd ffi/dotnet && dotnet clean && dotnet build
+```
+
+### Debugging FFI Calls
+
+Enable logging on both sides:
+
+```csharp
+// .NET side
+IronRdp.SetLogLevel(LogLevel.Trace);
+```
+
+```shell
+# Rust side
+IRONRDP_LOG=trace dotnet run --project YourProject
+```
+
+## Production Deployment
+
+### Packaging Native Library
+
+Include the native library with your .NET application:
+
+```xml
+<!-- YourProject.csproj -->
+<ItemGroup>
+  <None Include="../../target/release/libironrdp_ffi.so">
+    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+  </None>
+</ItemGroup>
+```
+
+### Cross-Platform Distribution
+
+```shell
+# Build for multiple platforms
+cargo xtask ffi build --release --target x86_64-pc-windows-gnu
+cargo xtask ffi build --release --target x86_64-unknown-linux-gnu
+cargo xtask ffi build --release --target x86_64-apple-darwin
+```
+
+Package all platform libraries:
+
+```
+YourApp/
+├── runtimes/
+│   ├── win-x64/native/ironrdp_ffi.dll
+│   ├── linux-x64/native/libironrdp_ffi.so
+│   └── osx-x64/native/libironrdp_ffi.dylib
+└── YourApp.dll
+```
+
+## Next Steps
+
+- [Building a Client](/guides/building-a-client) - Understand the underlying Rust API
+- [WebAssembly](/guides/webassembly) - Use IronRDP in web browsers
+- [Virtual Channels](/guides/virtual-channels) - Implement custom channels via FFI

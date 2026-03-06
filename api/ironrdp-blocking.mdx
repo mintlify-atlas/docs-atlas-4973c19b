@@ -1,0 +1,199 @@
+---
+title: ironrdp-blocking
+description: Blocking I/O abstraction for IronRDP state machines
+---
+
+`ironrdp-blocking` provides blocking I/O abstractions that wrap IronRDP state machines, offering a simpler synchronous API for RDP connections when concurrency is not required.
+
+## Overview
+
+This crate is a higher-level abstraction for IronRDP state machines using blocking I/O instead of asynchronous I/O. It's ideal when:
+
+- Concurrency is not a requirement
+- You prefer simpler synchronous code
+- You want fewer dependencies than async alternatives
+- You're working in environments without async runtime support
+
+## Core Components
+
+### Framed
+
+The `Framed<S>` type wraps any stream implementing `std::io::Read` and `std::io::Write`, providing buffered RDP protocol frame reading and writing.
+
+```rust
+use ironrdp_blocking::Framed;
+use std::net::TcpStream;
+
+let stream = TcpStream::connect("rdp.example.com:3389")?;
+let mut framed = Framed::new(stream);
+```
+
+#### Reading Frames
+
+The framed wrapper provides several methods for reading RDP protocol frames:
+
+**Read Exact Bytes**
+
+Accumulates and returns exactly the specified number of bytes:
+
+```rust
+// Read exactly 1024 bytes
+let data = framed.read_exact(1024)?;
+```
+
+**Read PDU Frames**
+
+Reads a complete RDP PDU frame, automatically detecting the frame size:
+
+```rust
+let (action, frame) = framed.read_pdu()?;
+
+match action {
+    ironrdp_pdu::Action::FastPath => {
+        // Handle fast-path frame
+    }
+    ironrdp_pdu::Action::X224 => {
+        // Handle X.224 frame
+    }
+}
+```
+
+**Read by Hint**
+
+Reads frames using a PDU hint that knows how to find frame boundaries:
+
+```rust
+use ironrdp_pdu::PduHint;
+
+let hint: &dyn PduHint = /* ... */;
+let bytes = framed.read_by_hint(hint)?;
+```
+
+#### Writing Frames
+
+Write complete buffers to the underlying stream:
+
+```rust
+let pdu_bytes = /* encode your PDU */;
+framed.write_all(&pdu_bytes)?;
+```
+
+#### Accessing the Stream
+
+You can access the underlying stream and buffered data:
+
+```rust
+// Peek at buffered data without consuming
+let buffered = framed.peek();
+
+// Get references to stream and buffer
+let (stream, buffer) = framed.get_inner();
+
+// Get mutable references
+let (stream, buffer) = framed.get_inner_mut();
+
+// Extract the stream, consuming the framed wrapper
+let (stream, leftover) = framed.into_inner();
+
+// Extract without leftover (panics if buffer is not empty)
+let stream = framed.into_inner_no_leftover();
+```
+
+### Connection Sequence
+
+The crate provides functions to drive the RDP connection sequence using blocking I/O.
+
+#### Basic Connection Flow
+
+```rust
+use ironrdp_blocking::{connect_begin, mark_as_upgraded, connect_finalize};
+use ironrdp_connector::ClientConnector;
+
+// Phase 1: Initial connection negotiation
+let should_upgrade = connect_begin(&mut framed, &mut connector)?;
+
+// Phase 2: Perform TLS upgrade (using your TLS implementation)
+let tls_stream = /* upgrade to TLS */;
+let mut framed = Framed::new(tls_stream);
+
+// Mark the upgrade as complete
+let upgraded = mark_as_upgraded(should_upgrade, &mut connector);
+
+// Phase 3: Finalize connection (including CredSSP if needed)
+let result = connect_finalize(
+    upgraded,
+    connector,
+    &mut framed,
+    &mut network_client,
+    server_name,
+    server_public_key,
+    kerberos_config,
+)?;
+```
+
+#### Skipping Initial Phase
+
+If the stream is already at the security upgrade phase:
+
+```rust
+let should_upgrade = skip_connect_begin(&mut connector);
+```
+
+#### Single Sequence Step
+
+For manual control over the connection sequence:
+
+```rust
+use ironrdp_core::WriteBuf;
+
+let mut buf = WriteBuf::new();
+single_sequence_step(&mut framed, &mut connector, &mut buf)?;
+```
+
+This function:
+1. Reads the next PDU if the connector expects input
+2. Steps the connector state machine forward
+3. Writes any response to the stream
+
+## Relationship to Core State Machines
+
+`ironrdp-blocking` wraps the core state machines from `ironrdp-connector`:
+
+- **State machines** (`ironrdp-connector::ClientConnector`) handle protocol logic
+- **Blocking I/O layer** (this crate) handles synchronous network communication
+- **Framed wrapper** manages buffering and frame boundary detection
+
+The blocking layer calls into the state machines at each step, reading and writing frames as needed, but does so synchronously without async/await.
+
+## Error Handling
+
+Most operations return `std::io::Result<T>` or `ironrdp_connector::ConnectorResult<T>`. Common error scenarios:
+
+- **UnexpectedEof**: Connection closed before receiving expected data
+- **Frame parsing errors**: Malformed RDP frames
+- **Protocol errors**: Connection sequence violations
+
+## When to Use
+
+Use `ironrdp-blocking` when:
+
+- You're building a simple RDP client without concurrency needs
+- You're working in embedded environments without async support
+- You prefer straightforward blocking I/O patterns
+- You're prototyping and want minimal complexity
+
+For concurrent connections or high-performance scenarios, consider `ironrdp-async` with `ironrdp-tokio` or `ironrdp-futures` instead.
+
+## Dependencies
+
+- **ironrdp-connector**: Connection state machines
+- **ironrdp-core**: Core RDP types and utilities
+- **ironrdp-pdu**: PDU encoding and decoding
+- **bytes**: Efficient byte buffer management
+- **tracing**: Structured logging
+
+## Related Crates
+
+- [ironrdp-async](/api/ironrdp-async) - Async I/O abstractions
+- [ironrdp-connector](/api/ironrdp-connector) - Connection state machines
+- [ironrdp-tls](/api/ironrdp-tls) - TLS upgrade helpers

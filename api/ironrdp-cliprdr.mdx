@@ -1,0 +1,177 @@
+---
+title: ironrdp-cliprdr
+description: Clipboard redirection virtual channel implementation
+---
+
+The `ironrdp-cliprdr` crate implements the CLIPRDR static virtual channel for clipboard redirection as specified in [MS-RDPECLIP](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpeclip/). This channel enables copy/paste functionality between the local machine and the remote desktop session.
+
+## Overview
+
+The clipboard redirection channel operates through a state machine that coordinates clipboard operations between client and server. It supports both simple text/image clipboard transfers and complex file transfers with delay rendering.
+
+## Core Types
+
+### Cliprdr
+
+The main processor for the CLIPRDR channel, generic over a `Role` type parameter.
+
+```rust
+pub struct Cliprdr<R: Role> {
+    backend: Box<dyn CliprdrBackend>,
+    capabilities: Capabilities,
+    state: CliprdrState,
+    _marker: core::marker::PhantomData<R>,
+}
+
+pub type CliprdrClient = Cliprdr<Client>;
+pub type CliprdrServer = Cliprdr<Server>;
+```
+
+**Key Methods:**
+
+- `new(backend: Box<dyn CliprdrBackend>) -> Self` - Creates a new CLIPRDR processor with the given backend
+- `initiate_copy(available_formats: &[ClipboardFormat]) -> PduResult<CliprdrSvcMessages<R>>` - Initiates a copy operation
+- `initiate_paste(requested_format: ClipboardFormatId) -> PduResult<CliprdrSvcMessages<R>>` - Initiates a paste operation
+- `submit_format_data(response: OwnedFormatDataResponse) -> PduResult<CliprdrSvcMessages<R>>` - Submits format data response
+- `lock_clipboard(clip_data_id: u32)` - Locks clipboard data before file transfer
+- `unlock_clipboard(clip_data_id: u32)` - Unlocks clipboard data after transfer
+- `request_file_contents(request: FileContentsRequest)` - Requests file contents from remote
+- `submit_file_contents(response: FileContentsResponse)` - Submits file contents response
+
+See: `ironrdp-cliprdr/src/lib.rs:54`
+
+### CliprdrBackend
+
+OS-specific clipboard backend interface that handles platform-specific clipboard operations.
+
+```rust
+pub trait CliprdrBackend: AsAny + core::fmt::Debug + Send {
+    fn temporary_directory(&self) -> &str;
+    fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags;
+    fn on_ready(&mut self);
+    fn on_request_format_list(&mut self);
+    fn on_process_negotiated_capabilities(&mut self, capabilities: ClipboardGeneralCapabilityFlags);
+    fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]);
+    fn on_format_data_request(&mut self, request: FormatDataRequest);
+    fn on_format_data_response(&mut self, response: FormatDataResponse<'_>);
+    fn on_file_contents_request(&mut self, request: FileContentsRequest);
+    fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>);
+    fn on_lock(&mut self, data_id: LockDataId);
+    fn on_unlock(&mut self, data_id: LockDataId);
+}
+```
+
+See: `ironrdp-cliprdr/src/backend.rs:69`
+
+## Protocol Flow
+
+### Initialization
+
+1. Server sends `Capabilities` and `MonitorReady` PDUs
+2. Client responds with its `Capabilities`, `TemporaryDirectory`, and initial `FormatList`
+3. Server acknowledges with `FormatListResponse`
+4. Channel transitions to `Ready` state
+
+### Copy Operation (Local to Remote)
+
+1. User initiates copy on client side
+2. Client calls `initiate_copy()` with available formats
+3. Client sends `FormatList` PDU to server
+4. Server responds with `FormatListResponse`
+5. When user pastes on server, server sends `FormatDataRequest`
+6. Client backend receives request via `on_format_data_request()`
+7. Client sends format data via `submit_format_data()`
+
+### Paste Operation (Remote to Local)
+
+1. User initiates copy on server side
+2. Server sends `FormatList` with available formats
+3. Client receives formats via `on_remote_copy()`
+4. When user pastes on client, client calls `initiate_paste()`
+5. Client sends `FormatDataRequest` to server
+6. Server responds with `FormatDataResponse`
+7. Client receives data via `on_format_data_response()`
+
+### File Transfer Operations
+
+For file transfers, the channel supports:
+
+- **Lock/Unlock**: Ensures data stability during multi-part file transfers
+- **File Contents Requests**: Retrieves specific byte ranges from files
+- **Delay Rendering**: Files are only transferred when actually pasted
+
+```rust
+// Lock clipboard data before requesting file contents
+let messages = cliprdr.lock_clipboard(clip_data_id)?;
+send_messages(messages);
+
+// Request specific file contents
+let request = FileContentsRequest {
+    stream_id: 0,
+    list_index: 0,
+    flags: FileContentsFlags::SIZE,
+    position: 0,
+    cb_requested: 8,
+    clip_data_id: Some(clip_data_id),
+};
+let messages = cliprdr.request_file_contents(request)?;
+send_messages(messages);
+
+// Unlock when done
+let messages = cliprdr.unlock_clipboard(clip_data_id)?;
+send_messages(messages);
+```
+
+## PDU Types
+
+The `pdu` module defines all clipboard protocol data units:
+
+- `ClipboardPdu` - Top-level PDU enum containing all message types
+- `Capabilities` - Clipboard capabilities negotiation
+- `FormatList` - List of available clipboard formats
+- `FormatDataRequest` / `FormatDataResponse` - Request/response for clipboard data
+- `FileContentsRequest` / `FileContentsResponse` - Request/response for file contents
+- `LockDataId` / `UnlockDataId` - Lock/unlock clipboard data during file transfers
+- `ClientTemporaryDirectory` - Client's temporary directory path
+
+## Clipboard Formats
+
+```rust
+pub struct ClipboardFormat {
+    pub id: ClipboardFormatId,
+    pub name: Option<String>,
+}
+
+pub enum ClipboardFormatId {
+    Standard(StandardClipboardFormat),
+    Custom(u16),
+}
+
+pub enum StandardClipboardFormat {
+    Text = 1,
+    Bitmap = 2,
+    MetafilePict = 3,
+    // ... more formats
+    FileList = 49159,
+}
+```
+
+## Implementation Notes
+
+<Note>
+The CLIPRDR channel requires `CHANNEL_FLAG_SHOW_PROTOCOL` flag for all messages as they contain chunked data per MS-RDPBCGR specification.
+</Note>
+
+<Warning>
+Do not commit files that likely contain secrets (.env, credentials.json, etc.) to the clipboard operations.
+</Warning>
+
+## Related Crates
+
+- **ironrdp-cliprdr-native**: Platform-specific clipboard backend implementations for Windows, macOS, and Linux
+- **ironrdp-cliprdr-format**: Clipboard format definitions and conversions
+- **ironrdp-svc**: Static virtual channel traits and infrastructure
+
+## References
+
+- [MS-RDPECLIP: Remote Desktop Protocol: Clipboard Virtual Channel Extension](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpeclip/)

@@ -1,0 +1,321 @@
+---
+title: ironrdp-core
+description: Common traits and types for the IronRDP project
+---
+
+<Note>
+**Version:** 0.1.5  
+**Docs.rs:** [ironrdp-core](https://docs.rs/ironrdp-core/latest/ironrdp_core/)
+</Note>
+
+## Overview
+
+The `ironrdp-core` crate provides foundational traits and types used throughout IronRDP. It defines the core encoding/decoding infrastructure, cursor utilities, and error types that form the basis of all PDU operations.
+
+### Key Design Principles
+
+- **`no_std` compatible**: Core functionality works without the standard library
+- **Object-safe traits**: Enables dynamic dispatch for protocol PDUs
+- **Zero-copy parsing**: Uses cursors instead of allocating intermediate buffers
+- **Type-safe encoding**: Size is computed before writing to prevent buffer overruns
+
+## Core Traits
+
+### Encode
+
+```rust
+pub trait Encode {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()>;
+    fn name(&self) -> &'static str;
+    fn size(&self) -> usize;
+}
+```
+
+Trait for types that can be encoded into binary form. All RDP PDUs implement this trait.
+
+**Key Methods:**
+- `encode()` - Writes the PDU to a `WriteCursor`
+- `name()` - Returns a static name for debugging/logging
+- `size()` - Computes the exact size in bytes before encoding
+
+**Helper Functions:**
+
+```rust
+// Encode to a fixed-size buffer
+pub fn encode<T: Encode>(pdu: &T, dst: &mut [u8]) -> EncodeResult<usize>
+
+// Encode using a WriteCursor
+pub fn encode_cursor<T: Encode>(pdu: &T, dst: &mut WriteCursor<'_>) -> EncodeResult<()>
+
+// Encode to a growable buffer (requires alloc feature)
+pub fn encode_buf<T: Encode>(pdu: &T, buf: &mut WriteBuf) -> EncodeResult<usize>
+
+// Encode to a new Vec (convenience function)
+pub fn encode_vec<T: Encode>(pdu: &T) -> EncodeResult<Vec<u8>>
+```
+
+### Decode
+
+```rust
+pub trait Decode<'de>: Sized {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self>;
+}
+```
+
+Trait for types that can be decoded from a byte stream. The lifetime parameter `'de` allows zero-copy parsing.
+
+**Helper Functions:**
+
+```rust
+// Decode from a byte slice
+pub fn decode<'de, T: Decode<'de>>(src: &'de [u8]) -> DecodeResult<T>
+
+// Decode using a ReadCursor
+pub fn decode_cursor<'de, T: Decode<'de>>(src: &mut ReadCursor<'de>) -> DecodeResult<T>
+```
+
+### DecodeOwned
+
+```rust
+pub trait DecodeOwned: Sized {
+    fn decode_owned(src: &mut ReadCursor<'_>) -> DecodeResult<Self>;
+}
+```
+
+Similar to `Decode` but unconditionally returns an owned type (no lifetime parameter). Use when you need to own the decoded data.
+
+## Cursor Types
+
+### ReadCursor
+
+```rust
+pub struct ReadCursor<'a> { /* private fields */ }
+```
+
+Zero-copy cursor for reading bytes from a buffer. Tracks position and provides typed read methods.
+
+**Common Methods:**
+
+<ParamField path="new" type="fn(bytes: &'a [u8]) -> Self">
+Create a new cursor from a byte slice
+</ParamField>
+
+<ParamField path="read_u8" type="fn(&mut self) -> u8">
+Read a single byte
+</ParamField>
+
+<ParamField path="read_u16" type="fn(&mut self) -> u16">
+Read a little-endian u16
+</ParamField>
+
+<ParamField path="read_u16_be" type="fn(&mut self) -> u16">
+Read a big-endian u16
+</ParamField>
+
+<ParamField path="read_u32" type="fn(&mut self) -> u32">
+Read a little-endian u32
+</ParamField>
+
+<ParamField path="read_slice" type="fn(&mut self, n: usize) -> &'a [u8]">
+Read a slice of n bytes
+</ParamField>
+
+<ParamField path="remaining" type="fn(&self) -> &'a [u8]">
+Get the remaining unread bytes
+</ParamField>
+
+<ParamField path="len" type="fn(&self) -> usize">
+Number of bytes remaining
+</ParamField>
+
+<ParamField path="pos" type="fn(&self) -> usize">
+Current position in the buffer
+</ParamField>
+
+**Example:**
+
+```rust
+use ironrdp_core::ReadCursor;
+
+let data = &[0x01, 0x02, 0x03, 0x04];
+let mut cursor = ReadCursor::new(data);
+
+let first = cursor.read_u8();  // 0x01
+let second = cursor.read_u16(); // 0x0302 (little-endian)
+assert_eq!(cursor.len(), 1); // 1 byte remaining
+```
+
+### WriteCursor
+
+```rust
+pub struct WriteCursor<'a> { /* private fields */ }
+```
+
+Cursor for writing bytes to a mutable buffer. Provides type-safe write methods and tracks position.
+
+**Common Methods:**
+
+<ParamField path="new" type="fn(bytes: &'a mut [u8]) -> Self">
+Create a new cursor from a mutable byte slice
+</ParamField>
+
+<ParamField path="write_u8" type="fn(&mut self, value: u8)">
+Write a single byte
+</ParamField>
+
+<ParamField path="write_u16" type="fn(&mut self, value: u16)">
+Write a little-endian u16
+</ParamField>
+
+<ParamField path="write_u16_be" type="fn(&mut self, value: u16)">
+Write a big-endian u16
+</ParamField>
+
+<ParamField path="write_u32" type="fn(&mut self, value: u32)">
+Write a little-endian u32
+</ParamField>
+
+<ParamField path="write_slice" type="fn(&mut self, slice: &[u8])">
+Write a slice of bytes
+</ParamField>
+
+<ParamField path="pos" type="fn(&self) -> usize">
+Current position (number of bytes written)
+</ParamField>
+
+**Example:**
+
+```rust
+use ironrdp_core::WriteCursor;
+
+let mut buffer = [0u8; 8];
+let mut cursor = WriteCursor::new(&mut buffer);
+
+cursor.write_u8(0x01);
+cursor.write_u16(0x0302); // little-endian
+cursor.write_u32(0x07060504); // little-endian
+
+assert_eq!(cursor.pos(), 7);
+```
+
+### WriteBuf
+
+```rust
+pub struct WriteBuf { /* private fields */ }
+```
+
+Growable write buffer that manages a `Vec<u8>` internally. Maintains separate "filled" and "unfilled" regions.
+
+<Note>
+Requires the `alloc` feature. Use `WriteBuf` when the output size is not known in advance.
+</Note>
+
+**Common Methods:**
+
+<ParamField path="new" type="fn() -> Self">
+Create a new empty buffer
+</ParamField>
+
+<ParamField path="unfilled_to" type="fn(&mut self, size: usize) -> &mut [u8]">
+Get a mutable slice of at least `size` bytes, growing if necessary
+</ParamField>
+
+<ParamField path="advance" type="fn(&mut self, n: usize)">
+Mark `n` bytes as filled after writing to `unfilled_to()`
+</ParamField>
+
+<ParamField path="filled" type="fn(&self) -> &[u8]">
+Get the filled portion of the buffer
+</ParamField>
+
+<ParamField path="clear" type="fn(&mut self)">
+Reset the filled region without deallocating
+</ParamField>
+
+**Example:**
+
+```rust
+use ironrdp_core::{WriteBuf, WriteCursor, encode_buf};
+
+let mut buf = WriteBuf::new();
+
+// Write multiple PDUs
+for pdu in pdus {
+    encode_buf(&pdu, &mut buf)?;
+}
+
+// Get all encoded data
+let data = buf.filled();
+
+// Reuse buffer for next batch
+buf.clear();
+```
+
+## Error Types
+
+### EncodeError & DecodeError
+
+```rust
+pub type EncodeResult<T> = Result<T, EncodeError>;
+pub type DecodeResult<T> = Result<T, DecodeError>;
+
+pub enum EncodeErrorKind {
+    NotEnoughBytes { received: usize, expected: usize },
+    InvalidField { field: &'static str, reason: &'static str },
+    UnexpectedMessageType { got: u8 },
+    UnsupportedVersion { got: u8 },
+    UnsupportedValue { name: &'static str, value: String },
+    Other { description: &'static str },
+}
+```
+
+Both encode and decode operations return structured errors with context.
+
+**Example Error Handling:**
+
+```rust
+use ironrdp_core::{decode, DecodeError};
+
+match decode::<MyPdu>(&bytes) {
+    Ok(pdu) => { /* process pdu */ },
+    Err(e) => {
+        eprintln!("Failed to decode: {}", e);
+        // Error includes context and source chain
+    }
+}
+```
+
+## Features
+
+<ParamField path="std" type="feature">
+Enables standard library support (includes `alloc`)
+</ParamField>
+
+<ParamField path="alloc" type="feature">
+Enables heap allocations (`WriteBuf`, `Vec` support)
+</ParamField>
+
+## Usage Notes
+
+<Note>
+**`WriteCursor` vs `WriteBuf`:**
+- Use `WriteCursor` when you know the exact size and want syscall-free, infallible writes
+- Use `WriteBuf` when size is unknown and you need the buffer to grow automatically
+- `WriteCursor` wraps `&mut [u8]` for stack/static buffers
+- `WriteBuf` manages `Vec<u8>` internally and can resize
+</Note>
+
+<Note>
+**Object Safety:**  
+The `Encode` trait is intentionally object-safe to enable dynamic dispatch:
+
+```rust
+let pdus: Vec<Box<dyn Encode>> = vec![Box::new(pdu1), Box::new(pdu2)];
+```
+</Note>
+
+## See Also
+
+- [ironrdp-pdu](/api/ironrdp-pdu) - PDU definitions that use these traits
+- [ironrdp-svc](/api/ironrdp-svc) - Static virtual channel traits
+- [ARCHITECTURE.md](https://github.com/Devolutions/IronRDP/blob/master/ARCHITECTURE.md) - Crate architecture

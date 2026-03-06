@@ -1,0 +1,334 @@
+---
+title: ironrdp-input
+description: Utilities to manage and build RDP input packets
+---
+
+<Note>
+**Version:** 0.5.0  
+**Docs.rs:** [ironrdp-input](https://docs.rs/ironrdp-input/latest/ironrdp_input/)
+</Note>
+
+## Overview
+
+The `ironrdp-input` crate provides helpers to build RDP FastPath input events from high-level operations. It maintains input state (keys pressed, mouse buttons down) and generates correct event sequences, including:
+
+- Suppressing duplicate events
+- Synthesizing key release before re-press
+- Handling extended scancodes
+- Managing Unicode keyboard input
+- Tracking mouse position and buttons
+
+## Core Types
+
+### Database
+
+```rust
+pub struct Database { /* ... */ }
+
+impl Database {
+    pub fn new() -> Self;
+    
+    pub fn apply(
+        &mut self,
+        transaction: impl IntoIterator<Item = Operation>
+    ) -> SmallVec<[FastPathInputEvent; 2]>;
+    
+    pub fn release_all(&mut self) -> SmallVec<[FastPathInputEvent; 2]>;
+    
+    // State queries
+    pub fn is_key_pressed(&self, scancode: Scancode) -> bool;
+    pub fn is_unicode_key_pressed(&self, character: char) -> bool;
+    pub fn is_mouse_button_pressed(&self, button: MouseButton) -> bool;
+    pub fn mouse_position(&self) -> MousePosition;
+    pub fn keyboard_state(&self) -> &KeyboardState;
+    pub fn mouse_buttons_state(&self) -> &MouseButtonsState;
+}
+```
+
+The `Database` is the main entry point. It tracks input state and produces RDP events.
+
+### Operation
+
+```rust
+pub enum Operation {
+    MouseButtonPressed(MouseButton),
+    MouseButtonReleased(MouseButton),
+    MouseMove(MousePosition),
+    WheelRotations(WheelRotations),
+    KeyPressed(Scancode),
+    KeyReleased(Scancode),
+    UnicodeKeyPressed(char),
+    UnicodeKeyReleased(char),
+}
+```
+
+High-level input operations submitted to the database.
+
+### Scancode
+
+```rust
+pub struct Scancode {
+    code: u8,
+    extended: bool,
+}
+
+impl Scancode {
+    pub const fn from_u8(extended: bool, code: u8) -> Self;
+    pub const fn from_u16(scancode: u16) -> Self;
+    pub fn as_u8(self) -> (bool, u8);
+    pub fn as_u16(self) -> u16;
+    pub fn as_idx(self) -> usize; // For bitmap index
+}
+```
+
+Keyboard scan code with optional extended flag.
+
+**Example:**
+
+```rust
+use ironrdp_input::Scancode;
+
+// Standard scancode
+let a_key = Scancode::from_u8(false, 0x1E);
+
+// Extended scancode (e.g., right Ctrl)
+let right_ctrl = Scancode::from_u8(true, 0x1D);
+let right_ctrl = Scancode::from_u16(0xE01D); // Equivalent
+```
+
+### MouseButton
+
+```rust
+pub enum MouseButton {
+    Left = 0,
+    Middle = 1,
+    Right = 2,
+    X1 = 3, // Browser Back
+    X2 = 4, // Browser Forward
+}
+
+impl MouseButton {
+    pub fn from_web_button(value: u8) -> Option<Self>;
+    pub fn from_native_button(value: u16) -> Option<Self>;
+    pub fn as_idx(self) -> usize;
+}
+```
+
+### MousePosition
+
+```rust
+pub struct MousePosition {
+    pub x: u16,
+    pub y: u16,
+}
+```
+
+### WheelRotations
+
+```rust
+pub struct WheelRotations {
+    pub is_vertical: bool,
+    pub rotation_units: i16,
+}
+```
+
+Mouse wheel delta. Positive values = scroll up/right, negative = scroll down/left.
+
+## Usage Example
+
+### Basic Keyboard Input
+
+```rust
+use ironrdp_input::{Database, Operation, Scancode};
+
+let mut db = Database::new();
+
+// Press and release 'A' key
+let ops = vec![
+    Operation::KeyPressed(Scancode::from_u8(false, 0x1E)),
+    Operation::KeyReleased(Scancode::from_u8(false, 0x1E)),
+];
+
+let events = db.apply(ops);
+// events contains FastPathInputEvent::KeyboardEvent(...)
+
+// Send events to server
+for event in events {
+    // encode and send event
+}
+```
+
+### Mouse Input
+
+```rust
+use ironrdp_input::{Database, Operation, MouseButton, MousePosition};
+
+let mut db = Database::new();
+
+let ops = vec![
+    Operation::MouseMove(MousePosition { x: 100, y: 200 }),
+    Operation::MouseButtonPressed(MouseButton::Left),
+    Operation::MouseButtonReleased(MouseButton::Left),
+];
+
+let events = db.apply(ops);
+// Generates MouseEvent PDUs with MOVE, DOWN, and UP flags
+```
+
+### Unicode Input
+
+```rust
+use ironrdp_input::{Database, Operation};
+
+let mut db = Database::new();
+
+let ops = vec![
+    Operation::UnicodeKeyPressed('你'),
+    Operation::UnicodeKeyReleased('你'),
+];
+
+let events = db.apply(ops);
+// Generates UnicodeKeyboardEvent with UTF-16 code units
+```
+
+### State Deduplication
+
+The database automatically suppresses no-op events:
+
+```rust
+let mut db = Database::new();
+let key = Scancode::from_u8(false, 0x1E);
+
+// First press generates an event
+let events = db.apply(vec![Operation::KeyPressed(key)]);
+assert_eq!(events.len(), 1);
+
+// Second press with no release is ignored
+let events = db.apply(vec![Operation::KeyPressed(key)]);
+assert_eq!(events.len(), 0); // No duplicate event
+```
+
+### Releasing All Inputs
+
+```rust
+let mut db = Database::new();
+
+// Press some keys and buttons
+db.apply(vec![
+    Operation::KeyPressed(Scancode::from_u8(false, 0x1E)),
+    Operation::MouseButtonPressed(MouseButton::Left),
+]);
+
+// Release everything
+let events = db.release_all();
+// Generates KeyboardEvent(RELEASE) and MouseEvent (up) for all pressed inputs
+```
+
+Useful when losing focus or disconnecting.
+
+## Lock Key Synchronization
+
+```rust
+pub fn synchronize_event(
+    scroll_lock: bool,
+    num_lock: bool,
+    caps_lock: bool,
+    kana_lock: bool,
+) -> FastPathInputEvent
+```
+
+Generate a synchronization event to match client and server lock key states.
+
+**Example:**
+
+```rust
+use ironrdp_input::synchronize_event;
+
+let event = synchronize_event(
+    false, // scroll lock off
+    true,  // num lock on
+    false, // caps lock off
+    false, // kana lock off
+);
+
+// Send this event when window gains focus
+```
+
+## State Types
+
+```rust
+pub type KeyboardState = BitArr!(for 512);
+pub type MouseButtonsState = BitArr!(for 5);
+```
+
+Bit arrays for tracking input state efficiently:
+- `KeyboardState`: 512 bits (256 standard + 256 extended scancodes)
+- `MouseButtonsState`: 5 bits (one per mouse button)
+
+**Example:**
+
+```rust
+let state = db.keyboard_state();
+for idx in state.iter_ones() {
+    println!("Scancode {} is pressed", idx);
+}
+```
+
+## Advanced: Web Integration
+
+```rust
+use ironrdp_input::{MouseButton, Scancode, Operation};
+
+// Convert web MouseEvent button to RDP
+let button = MouseButton::from_web_button(0).unwrap(); // Left button
+
+// Convert web KeyboardEvent code to scancode
+// (requires separate mapping table)
+let scancode = key_code_to_scancode("KeyA"); // -> Scancode(0x1E)
+```
+
+## Dependencies
+
+- `ironrdp-pdu` - PDU structures for `FastPathInputEvent` (public)
+- `bitvec` - Efficient bit arrays for state tracking
+- `smallvec` - Stack-allocated vectors for events
+
+## Usage Notes
+
+<Note>
+**Event Ordering:**  
+The database maintains correct event ordering. For example, if a key is already pressed and pressed again, the database synthesizes a release before the new press:
+
+```rust
+db.apply(vec![Operation::KeyPressed(key)]);
+// Later...
+db.apply(vec![Operation::KeyPressed(key)]);
+// Generates: [KeyRelease(key), KeyPress(key)]
+```
+</Note>
+
+<Note>
+**Extended Scancodes:**  
+Extended scancodes (0xE0 prefix) are common for keys like arrows, right Ctrl/Alt, and navigation keys. Use `Scancode::from_u16()` with the 0xE000 bit set:
+
+```rust
+let right_arrow = Scancode::from_u16(0xE04D);
+let left_arrow = Scancode::from_u16(0xE04B);
+```
+</Note>
+
+<Note>
+**Mouse Coordinates:**  
+RDP mouse coordinates are in the range `[0, 65535]` and are normalized to the desktop size. Scale physical pixels accordingly:
+
+```rust
+let rdp_x = (physical_x * 65535) / desktop_width;
+let rdp_y = (physical_y * 65535) / desktop_height;
+```
+</Note>
+
+## See Also
+
+- [ironrdp-pdu](/api/ironrdp-pdu) - Input PDU structures
+- [ironrdp-session](/api/ironrdp-session) - Session management
+- [MS-RDPBCGR §2.2.8](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/) - Input PDU specification

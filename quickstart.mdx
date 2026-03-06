@@ -1,80 +1,605 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart
+description: Build your first RDP client with IronRDP in minutes
 ---
 
-## Get started in three steps
+This guide will walk you through creating a simple RDP client that connects to a server, captures graphics updates, and saves them as an image.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+Ensure you have:
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+- Rust 1.88.0 or later installed
+- An RDP server to connect to (Windows machine, RDP server, etc.)
+- Basic familiarity with Rust and async programming
 
-### Step 2: Deploy your changes
+## Project Setup
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+<Steps>
+  <Step title="Create a new Rust project">
+    ```bash
+    cargo new rdp-screenshot
+    cd rdp-screenshot
+    ```
+  </Step>
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+  <Step title="Add dependencies">
+    Edit `Cargo.toml` to include IronRDP and required dependencies:
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+    ```toml
+    [dependencies]
+    ironrdp = { version = "0.14", features = ["connector", "session", "graphics"] }
+    ironrdp-blocking = "0.8"
+    ironrdp-pdu = "0.7"
+    tokio-rustls = "0.26"
+    sspi = { version = "0.18", features = ["network_client"] }
+    image = { version = "0.25", default-features = false, features = ["png"] }
+    x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+    anyhow = "1"
+    tracing = "0.1"
+    tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+    ```
+  </Step>
 
-### Step 3: Go live
+  <Step title="Set up logging (optional but recommended)">
+    ```rust
+    use tracing_subscriber::{prelude::*, EnvFilter};
+    use tracing::metadata::LevelFilter;
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    fn setup_logging() -> anyhow::Result<()> {
+        let fmt_layer = tracing_subscriber::fmt::layer().compact();
+        let env_filter = EnvFilter::builder()
+            .with_default_directive(LevelFilter::WARN.into())
+            .with_env_var("IRONRDP_LOG")
+            .from_env_lossy();
 
-## Next steps
+        tracing_subscriber::registry()
+            .with(fmt_layer)
+            .with(env_filter)
+            .try_init()?;
 
-Now that you have your docs running, explore these key features:
+        Ok(())
+    }
+    ```
 
-<CardGroup cols={2}>
+    Run with logging:
+    ```bash
+    IRONRDP_LOG=info cargo run
+    ```
+  </Step>
+</Steps>
 
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
+## Building a Simple Screenshot Client
 
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
+### Step 1: Configure the Connection
 
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
+Create a configuration for connecting to the RDP server:
 
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
+```rust
+use ironrdp::connector::{self, Credentials, DesktopSize};
+use ironrdp::pdu::gcc::KeyboardType;
+use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
+use ironrdp_pdu::rdp::client_info::{CompressionType, PerformanceFlags, TimezoneInfo};
 
-</CardGroup>
+fn build_config(
+    username: String,
+    password: String,
+    domain: Option<String>,
+) -> anyhow::Result<connector::Config> {
+    Ok(connector::Config {
+        credentials: Credentials::UsernamePassword { username, password },
+        domain,
+        enable_tls: false,
+        enable_credssp: true,
+        keyboard_type: KeyboardType::IbmEnhanced,
+        keyboard_subtype: 0,
+        keyboard_layout: 0,
+        keyboard_functional_keys_count: 12,
+        ime_file_name: String::new(),
+        dig_product_id: String::new(),
+        desktop_size: DesktopSize {
+            width: 1280,
+            height: 1024,
+        },
+        bitmap: None,
+        client_build: 0,
+        client_name: "ironrdp-quickstart".to_owned(),
+        client_dir: "C:\\Windows\\System32\\mstscax.dll".to_owned(),
+        platform: MajorPlatformType::UNIX,
+        enable_server_pointer: false,
+        request_data: None,
+        autologon: false,
+        enable_audio_playback: false,
+        compression_type: Some(CompressionType::Rdp61),
+        pointer_software_rendering: true,
+        multitransport_flags: None,
+        performance_flags: PerformanceFlags::default(),
+        desktop_scale_factor: 0,
+        hardware_id: None,
+        license_cache: None,
+        timezone_info: TimezoneInfo::default(),
+        alternate_shell: String::new(),
+        work_dir: String::new(),
+    })
+}
+```
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+The configuration includes many fields for fine-grained control. Most can use sensible defaults as shown above.
 </Note>
+
+### Step 2: Establish the Connection
+
+Connect to the RDP server using blocking I/O:
+
+```rust
+use std::net::TcpStream;
+use std::time::Duration;
+use ironrdp::connector::{ClientConnector, ConnectionResult};
+use ironrdp_blocking::Framed;
+use sspi::network_client::reqwest_network_client::ReqwestNetworkClient;
+use tokio_rustls::rustls;
+use anyhow::Context;
+
+type UpgradedFramed = Framed<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>;
+
+fn connect(
+    config: connector::Config,
+    server_name: String,
+    port: u16,
+) -> anyhow::Result<(ConnectionResult, UpgradedFramed)> {
+    // Resolve server address
+    let server_addr = (server_name.as_str(), port)
+        .to_socket_addrs()?
+        .next()
+        .context("failed to resolve server address")?;
+
+    // Establish TCP connection
+    let tcp_stream = TcpStream::connect(server_addr)
+        .context("failed to connect to server")?;
+
+    tcp_stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("set_read_timeout failed");
+
+    let client_addr = tcp_stream.local_addr()?;
+    let mut framed = Framed::new(tcp_stream);
+    let mut connector = ClientConnector::new(config, client_addr);
+
+    // Begin connection sequence
+    let should_upgrade = ironrdp_blocking::connect_begin(&mut framed, &mut connector)
+        .context("connection begin failed")?;
+
+    // Perform TLS upgrade
+    let initial_stream = framed.into_inner_no_leftover();
+    let (upgraded_stream, server_public_key) = 
+        tls_upgrade(initial_stream, server_name.clone())?;
+
+    let upgraded = ironrdp_blocking::mark_as_upgraded(should_upgrade, &mut connector);
+    let mut upgraded_framed = Framed::new(upgraded_stream);
+
+    // Finalize connection with authentication
+    let mut network_client = ReqwestNetworkClient;
+    let connection_result = ironrdp_blocking::connect_finalize(
+        upgraded,
+        connector,
+        &mut upgraded_framed,
+        &mut network_client,
+        server_name.into(),
+        server_public_key,
+        None,
+    )?;
+
+    Ok((connection_result, upgraded_framed))
+}
+```
+
+### Step 3: TLS Upgrade Helper
+
+Implement TLS upgrade with certificate verification disabled (for testing):
+
+```rust
+fn tls_upgrade(
+    stream: TcpStream,
+    server_name: String,
+) -> anyhow::Result<(rustls::StreamOwned<rustls::ClientConnection, TcpStream>, Vec<u8>)> {
+    use tokio_rustls::rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified};
+
+    #[derive(Debug)]
+    struct NoCertificateVerification;
+
+    impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
+        fn verify_server_cert(
+            &self,
+            _: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+            _: &[tokio_rustls::rustls::pki_types::CertificateDer<'_>],
+            _: &tokio_rustls::rustls::pki_types::ServerName<'_>,
+            _: &[u8],
+            _: tokio_rustls::rustls::pki_types::UnixTime,
+        ) -> Result<ServerCertVerified, tokio_rustls::rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+            _: &tokio_rustls::rustls::DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _: &[u8],
+            _: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+            _: &tokio_rustls::rustls::DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
+            use tokio_rustls::rustls::SignatureScheme::*;
+            vec![
+                RSA_PKCS1_SHA256, ECDSA_NISTP256_SHA256,
+                RSA_PSS_SHA256, ED25519,
+            ]
+        }
+    }
+
+    let mut config = rustls::client::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(NoCertificateVerification))
+        .with_no_client_auth();
+
+    config.resumption = rustls::client::Resumption::disabled();
+    let config = std::sync::Arc::new(config);
+
+    let server_name = server_name.try_into()?;
+    let client = rustls::ClientConnection::new(config, server_name)?;
+    let mut tls_stream = rustls::StreamOwned::new(client, stream);
+
+    use std::io::Write;
+    tls_stream.flush()?;
+
+    let cert = tls_stream
+        .conn
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .context("peer certificate missing")?;
+
+    use x509_cert::der::Decode;
+    let cert = x509_cert::Certificate::from_der(cert)?;
+    let server_public_key = cert
+        .tbs_certificate
+        .subject_public_key_info
+        .subject_public_key
+        .as_bytes()
+        .context("subject public key not aligned")?
+        .to_owned();
+
+    Ok((tls_stream, server_public_key))
+}
+```
+
+<Warning>
+This example disables certificate verification for simplicity. In production, always validate server certificates properly.
+</Warning>
+
+### Step 4: Process the Active Stage
+
+Handle the active session and capture graphics updates:
+
+```rust
+use ironrdp::session::{ActiveStage, ActiveStageOutput};
+use ironrdp::session::image::DecodedImage;
+use std::io::Write;
+
+fn active_stage(
+    connection_result: ConnectionResult,
+    mut framed: UpgradedFramed,
+    image: &mut DecodedImage,
+) -> anyhow::Result<()> {
+    let mut active_stage = ActiveStage::new(connection_result);
+
+    loop {
+        let (action, payload) = match framed.read_pdu() {
+            Ok(frame) => frame,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => return Err(e.into()),
+        };
+
+        let outputs = active_stage.process(image, action, &payload)?;
+
+        for output in outputs {
+            match output {
+                ActiveStageOutput::ResponseFrame(frame) => {
+                    framed.write_all(&frame)?;
+                }
+                ActiveStageOutput::Terminate(_) => return Ok(()),
+                _ => {}
+            }
+        }
+    }
+
+    Ok(())
+}
+```
+
+### Step 5: Complete Example
+
+<CodeGroup>
+
+```rust main.rs (Complete)
+use std::net::{TcpStream, ToSocketAddrs};
+use std::path::PathBuf;
+use std::time::Duration;
+use anyhow::Context;
+
+use ironrdp::connector::{self, Credentials, ConnectionResult};
+use ironrdp::pdu::gcc::KeyboardType;
+use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
+use ironrdp::session::{ActiveStage, ActiveStageOutput};
+use ironrdp::session::image::DecodedImage;
+use ironrdp_blocking::Framed;
+use ironrdp_pdu::rdp::client_info::{CompressionType, PerformanceFlags, TimezoneInfo};
+use sspi::network_client::reqwest_network_client::ReqwestNetworkClient;
+use tokio_rustls::rustls;
+
+fn main() -> anyhow::Result<()> {
+    let config = build_config(
+        "username".to_owned(),
+        "password".to_owned(),
+        None,
+    )?;
+
+    let (connection_result, framed) = connect(
+        config,
+        "192.168.1.100".to_owned(),
+        3389,
+    )?;
+
+    let mut image = DecodedImage::new(
+        ironrdp_graphics::image_processing::PixelFormat::RgbA32,
+        connection_result.desktop_size.width,
+        connection_result.desktop_size.height,
+    );
+
+    active_stage(connection_result, framed, &mut image)?;
+
+    // Save image
+    let img: image::ImageBuffer<image::Rgba<u8>, _> =
+        image::ImageBuffer::from_raw(
+            u32::from(image.width()),
+            u32::from(image.height()),
+            image.data(),
+        )
+        .context("invalid image")?;
+
+    img.save("output.png")?;
+    println!("Saved screenshot to output.png");
+
+    Ok(())
+}
+
+// Include build_config, connect, tls_upgrade, and active_stage from above
+```
+
+```bash Run
+cargo run
+```
+
+</CodeGroup>
+
+## Running the Example
+
+<Steps>
+  <Step title="Build the project">
+    ```bash
+    cargo build --release
+    ```
+  </Step>
+
+  <Step title="Run with your RDP server details">
+    ```bash
+    ./target/release/rdp-screenshot
+    ```
+
+    Or with logging:
+    ```bash
+    IRONRDP_LOG=info ./target/release/rdp-screenshot
+    ```
+  </Step>
+
+  <Step title="Check the output">
+    You should see `output.png` in your project directory containing a screenshot of the remote desktop.
+  </Step>
+</Steps>
+
+## Key Concepts Explained
+
+### Connection Lifecycle
+
+<Steps>
+  <Step title="Initial Connection">
+    `connect_begin()` starts the RDP handshake over TCP
+  </Step>
+
+  <Step title="TLS Upgrade">
+    The connection is upgraded to TLS for security
+  </Step>
+
+  <Step title="Authentication">
+    `connect_finalize()` completes authentication (CredSSP, NLA, etc.)
+  </Step>
+
+  <Step title="Active Stage">
+    The session enters active mode, processing graphics updates and user input
+  </Step>
+</Steps>
+
+### Understanding `ActiveStage`
+
+The `ActiveStage` is the heart of an RDP session:
+
+```rust
+pub struct ActiveStage { /* ... */ }
+
+impl ActiveStage {
+    pub fn process(
+        &mut self,
+        image: &mut DecodedImage,
+        action: Action,
+        payload: &[u8],
+    ) -> Result<Vec<ActiveStageOutput>> {
+        // Processes incoming PDUs and updates the image buffer
+    }
+}
+```
+
+**Key outputs:**
+
+- `ActiveStageOutput::ResponseFrame` - Data to send back to the server
+- `ActiveStageOutput::GraphicsUpdate` - Screen content changed
+- `ActiveStageOutput::Terminate` - Connection closed
+
+### Image Decoding
+
+`DecodedImage` manages the remote desktop framebuffer:
+
+```rust
+use ironrdp_graphics::image_processing::PixelFormat;
+
+let mut image = DecodedImage::new(
+    PixelFormat::RgbA32,  // 32-bit RGBA format
+    1920,                  // Width
+    1080,                  // Height
+);
+
+// After processing updates, access the raw pixel data:
+let pixel_data: &[u8] = image.data();
+```
+
+## Building an Async Client
+
+For production use, prefer async I/O with Tokio:
+
+```toml
+[dependencies]
+ironrdp = { version = "0.14", features = ["connector", "session"] }
+ironrdp-tokio = "0.5"
+tokio = { version = "1", features = ["full"] }
+```
+
+```rust
+use ironrdp_tokio::TokioFramed;
+use tokio::net::TcpStream;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let stream = TcpStream::connect("192.168.1.100:3389").await?;
+    let framed = TokioFramed::new(stream);
+    
+    // Use async versions of connect_begin/finalize
+    // ...
+
+    Ok(())
+}
+```
+
+<Tip>
+Refer to the full `ironrdp-client` implementation in the repository for a complete async example with GUI support.
+</Tip>
+
+## Common Issues
+
+<AccordionGroup>
+  <Accordion title="Connection timeout">
+    **Symptom:** `TcpStream::connect` hangs or times out
+
+    **Solutions:**
+    - Verify the server is reachable (`ping` the host)
+    - Check firewall rules (port 3389 must be open)
+    - Ensure RDP is enabled on the target machine
+  </Accordion>
+
+  <Accordion title="Authentication failed">
+    **Symptom:** Error during `connect_finalize`
+
+    **Solutions:**
+    - Verify username and password are correct
+    - Check domain name (use `None` for local accounts)
+    - Ensure CredSSP is enabled on the server
+  </Accordion>
+
+  <Accordion title="Black or incomplete image">
+    **Symptom:** Screenshot is saved but appears blank
+
+    **Solutions:**
+    - Increase the read timeout (some servers send updates slowly)
+    - Add a delay before saving the image to capture more updates
+    - Check logs for errors during graphics decoding
+  </Accordion>
+
+  <Accordion title="TLS handshake failure">
+    **Symptom:** Error during `tls_upgrade`
+
+    **Solutions:**
+    - Ensure the server supports TLS 1.2 or later
+    - Try with `enable_tls: false` for testing (not recommended for production)
+    - Check server certificate validity
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+Now that you've built a basic client, explore:
+
+<CardGroup cols={2}>
+  <Card title="Building Servers" icon="server" href="/guides/building-a-server">
+    Create custom RDP servers with IronRDP
+  </Card>
+  <Card title="Virtual Channels" icon="network-wired" href="/guides/virtual-channels">
+    Implement clipboard, audio, and custom channels
+  </Card>
+  <Card title="Examples" icon="code" href="https://github.com/Devolutions/IronRDP/tree/master/crates/ironrdp/examples">
+    Study the full screenshot and server examples
+  </Card>
+  <Card title="API Documentation" icon="book" href="https://docs.rs/ironrdp/">
+    Deep dive into the complete API reference
+  </Card>
+</CardGroup>
+
+## Real-World Examples
+
+The IronRDP repository includes production-ready examples:
+
+### Screenshot Example
+
+Located at `crates/ironrdp/examples/screenshot.rs` - a complete blocking client in ~500 lines:
+
+```bash
+cargo run --example=screenshot -- \
+  --host 192.168.1.100 \
+  -u Administrator \
+  -p MyPassword123 \
+  -o screenshot.png \
+  --compression-enabled true \
+  --compression-level 3
+```
+
+### Server Example
+
+Located at `crates/ironrdp/examples/server.rs` - a minimal RDP server:
+
+```bash
+cargo run --example=server -- \
+  --bind-addr 0.0.0.0:3389 \
+  --user testuser \
+  --pass testpass \
+  --sec hybrid
+```
+
+<Tip>
+Study these examples for production patterns, error handling, and best practices.
+</Tip>

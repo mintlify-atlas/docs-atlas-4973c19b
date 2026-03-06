@@ -1,0 +1,433 @@
+---
+title: Frequently Asked Questions
+description: Common questions about IronRDP architecture, usage, and implementation
+---
+
+Answers to frequently asked questions about IronRDP, its architecture, and how to use it effectively.
+
+## General Questions
+
+<AccordionGroup>
+  <Accordion title="What is IronRDP?">
+    IronRDP is a collection of Rust crates providing a complete implementation of the Microsoft Remote Desktop Protocol (RDP). It focuses on security, correctness, and modularity, making it suitable for building both RDP clients and servers.
+
+    The project is split into multiple tiers:
+    - **Core tier**: Foundational protocol implementation
+    - **Extra tier**: Higher-level abstractions and I/O
+    - **Internal tier**: Testing and tooling
+    - **Community tier**: Community-maintained extensions
+  </Accordion>
+
+  <Accordion title="Why use IronRDP instead of other RDP implementations?">
+    IronRDP offers several advantages:
+
+    - **Memory safety**: Written in Rust, eliminating entire classes of vulnerabilities
+    - **Modular design**: Use only the components you need
+    - **No-std support**: Core crates work in embedded and WASM environments
+    - **Well-documented**: Extensive documentation and MS-RDP spec references
+    - **Actively maintained**: Regular updates and security fixes
+    - **Cross-platform**: Works on Windows, macOS, Linux, and WebAssembly
+  </Accordion>
+
+  <Accordion title="What are the minimum requirements to use IronRDP?">
+    - **Rust**: Version 1.88.0 or later (pinned in `rust-toolchain.toml`)
+    - **Platform**: Windows, macOS, Linux, or WebAssembly
+    - **Dependencies**: Standard Rust toolchain (`cargo`, `rustc`)
+
+    For development:
+    - Run `cargo xtask bootstrap -v` to install additional tools
+    - See [Contributing Guide](/contributing) for full setup
+  </Accordion>
+
+  <Accordion title="Is IronRDP production-ready?">
+    IronRDP is used in production by [Devolutions](https://devolutions.net/) and others. The core protocol implementation is stable and well-tested.
+
+    However, different components have different maturity levels:
+    - **Core tier crates**: Production-ready, extensively tested and fuzzed
+    - **Extra tier crates**: Generally stable, used in production
+    - **Community tier crates**: Varying maturity, check individual crate documentation
+
+    Always test thoroughly for your specific use case.
+  </Accordion>
+</AccordionGroup>
+
+## Architecture Questions
+
+<AccordionGroup>
+  <Accordion title="What is the difference between core tier and extra tier crates?">
+    **Core Tier:**
+    - Foundational protocol implementation
+    - No I/O operations allowed
+    - Must be `no_std` compatible
+    - Strictly no platform-dependent code
+    - Must be fuzzed
+    - Examples: `ironrdp-core`, `ironrdp-pdu`, `ironrdp-svc`
+
+    **Extra Tier:**
+    - Higher-level abstractions
+    - I/O operations permitted
+    - Platform-specific code allowed
+    - Can depend on `std`
+    - Examples: `ironrdp-blocking`, `ironrdp-async`, `ironrdp-tokio`
+
+    See [ARCHITECTURE.md](https://github.com/Devolutions/IronRDP/blob/master/ARCHITECTURE.md) for details.
+  </Accordion>
+
+  <Accordion title="Why are there so many crates?">
+    IronRDP is split into many small crates for several reasons:
+
+    1. **Compilation parallelism**: Smaller crates compile faster in parallel
+    2. **Dependency management**: Use only what you need
+    3. **Clear boundaries**: Each crate has a single, focused responsibility
+    4. **Easier testing**: Test each component independently
+    5. **Reduced coupling**: Changes in one crate don't force rebuilding everything
+
+    The `ironrdp` meta-crate re-exports the most commonly used crates for convenience.
+  </Accordion>
+
+  <Accordion title="What is the purpose of ironrdp-core?">
+    `ironrdp-core` provides the foundational building blocks used by all other crates:
+
+    - `Encode` and `Decode` traits for PDU encoding/decoding
+    - `ReadCursor` and `WriteCursor` for `no_std` buffer I/O
+    - `WriteBuf` for managing encode buffers
+    - `AsAny` trait for type erasure and downcasting
+
+    It's intentionally kept small with minimal dependencies to enable parallel compilation and maintain `no_std` compatibility.
+  </Accordion>
+
+  <Accordion title="What are static vs dynamic virtual channels?">
+    **Static Virtual Channels (SVC):**
+    - Established during connection setup
+    - Fixed for the duration of the session
+    - Implemented via `SvcProcessor` trait in `ironrdp-svc`
+    - Examples: CLIPRDR, RDPSND, RDPDR
+
+    **Dynamic Virtual Channels (DVC):**
+    - Created and destroyed on-demand during session
+    - More flexible, supports multiple concurrent channels
+    - Implemented via `DvcProcessor` trait in `ironrdp-dvc`
+    - Multiplexed over DRDYNVC static channel
+    - Examples: Display Control, RemoteFX
+  </Accordion>
+</AccordionGroup>
+
+## Usage Questions
+
+<AccordionGroup>
+  <Accordion title="How do I create a basic RDP client?">
+    The simplest approach is to use `ironrdp-blocking`:
+
+    ```rust
+    use ironrdp::connector::{self, Credentials};
+    use ironrdp_blocking::Framed;
+    use std::net::TcpStream;
+
+    // Create configuration
+    let config = connector::Config {
+        credentials: Credentials::UsernamePassword {
+            username: "user".to_string(),
+            password: "pass".to_string(),
+        },
+        desktop_size: connector::DesktopSize {
+            width: 1280,
+            height: 1024,
+        },
+        // ... other fields
+    };
+
+    // Connect
+    let stream = TcpStream::connect("10.0.0.100:3389")?;
+    let mut framed = Framed::new(stream);
+    let mut connector = connector::ClientConnector::new(config, client_addr);
+
+    let should_upgrade = ironrdp_blocking::connect_begin(&mut framed, &mut connector)?;
+    // ... TLS upgrade and finalization
+    ```
+
+    See the [screenshot example](/examples/screenshot) for a complete implementation.
+  </Accordion>
+
+  <Accordion title="How do I handle virtual channels?">
+    Implement the appropriate processor trait:
+
+    **For Static Channels (SVC):**
+    ```rust
+    use ironrdp_svc::{SvcProcessor, SvcMessage};
+
+    struct MyChannel;
+
+    impl SvcProcessor for MyChannel {
+        fn channel_name(&self) -> ChannelName {
+            ChannelName::from_static(b"mychan\0\0")
+        }
+
+        fn process(&mut self, payload: &[u8]) -> PduResult<Vec<SvcMessage>> {
+            // Process incoming data
+            Ok(vec![])
+        }
+    }
+    ```
+
+    **For Dynamic Channels (DVC):**
+    ```rust
+    use ironrdp_dvc::{DvcProcessor, DvcMessage};
+
+    struct MyDynamicChannel;
+
+    impl DvcProcessor for MyDynamicChannel {
+        fn channel_name(&self) -> &str {
+            "MyDynamicChannel"
+        }
+
+        fn process(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
+            // Process incoming data
+            Ok(vec![])
+        }
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="How do I enable logging?">
+    IronRDP uses the `tracing` crate for structured logging. Configure it with the `IRONRDP_LOG` environment variable:
+
+    ```bash
+    # Show all IronRDP logs at info level
+    IRONRDP_LOG=info cargo run
+
+    # Debug level for specific module
+    IRONRDP_LOG=ironrdp_connector=debug cargo run
+
+    # Trace level for everything
+    IRONRDP_LOG=trace cargo run
+
+    # Multiple modules with different levels
+    IRONRDP_LOG="ironrdp_pdu=debug,ironrdp_session=trace" cargo run
+    ```
+
+    In code:
+    ```rust
+    use tracing::info;
+
+    info!(%server_addr, "Connected to server");
+    ```
+  </Accordion>
+
+  <Accordion title="How do I use IronRDP with async/await?">
+    Use `ironrdp-async` or `ironrdp-tokio`:
+
+    ```rust
+    use ironrdp_tokio::TokioFramed;
+    use tokio::net::TcpStream;
+
+    // Async connection
+    let stream = TcpStream::connect("10.0.0.100:3389").await?;
+    let mut framed = TokioFramed::new(stream);
+
+    // Use async versions of connect functions
+    let should_upgrade = ironrdp_async::connect_begin(&mut framed, &mut connector).await?;
+    ```
+
+    Or use `ironrdp-client` which provides a complete async client implementation.
+  </Accordion>
+</AccordionGroup>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Why am I getting 'oldString not found in content' errors?">
+    This error occurs when using the `Edit` tool with content that doesn't exactly match the file. Common causes:
+
+    1. **Line number prefixes**: Don't include line numbers from the Read tool output
+    2. **Indentation mismatch**: Ensure exact whitespace matching
+    3. **File changed**: File may have been modified since you read it
+
+    Solution: Always use the `Read` tool first, then match the content exactly (excluding line number prefixes).
+  </Accordion>
+
+  <Accordion title="Why is my connection failing during TLS upgrade?">
+    Common TLS issues:
+
+    1. **CredSSP requires TLS resumption disabled**:
+       ```rust
+       config.resumption = rustls::client::Resumption::disabled();
+       ```
+
+    2. **Certificate verification failing**: Use custom verifier for testing (not production!)
+    3. **Missing flush**: Call `tls_stream.flush()?` after creating the TLS connection
+
+    See the [screenshot example](/examples/screenshot) for proper TLS setup.
+  </Accordion>
+
+  <Accordion title="Why aren't my virtual channels working?">
+    Check these common issues:
+
+    1. **RDPDR requires RDPSND**: The RDPDR channel must be advertised with RDPSND channel
+    2. **Channel name formatting**: Static channel names must be exactly 7 bytes + null terminator
+    3. **Missing SHOW_PROTOCOL flag**: CLIPRDR messages require `CHANNEL_FLAG_SHOW_PROTOCOL`
+    4. **Capabilities not negotiated**: Wait for capability exchange before sending data
+
+    Enable debug logging for the channel to see detailed protocol flow:
+    ```bash
+    IRONRDP_LOG=ironrdp_cliprdr=debug cargo run
+    ```
+  </Accordion>
+
+  <Accordion title="How do I debug WebAssembly issues?">
+    For WASM debugging:
+
+    1. **Use console logging**: `web_sys::console::log_1()` for debug output
+    2. **Enable source maps**: Built automatically with `cargo xtask web build`
+    3. **Check browser console**: Look for JavaScript errors and panics
+    4. **Test in native first**: Verify code works in native Rust before WASM
+
+    Common WASM pitfalls:
+    - Exceeding stack size with large stack allocations
+    - Using unsupported system calls
+    - Threading (not supported without additional configuration)
+  </Accordion>
+</AccordionGroup>
+
+## Protocol Questions
+
+<AccordionGroup>
+  <Accordion title="Which RDP versions are supported?">
+    IronRDP supports RDP versions from 4.0 through 10.x, including:
+
+    - RDP 4.0: Basic bitmap transfers
+    - RDP 5.0-5.2: Enhanced compression
+    - RDP 6.0: Improved compression, font smoothing
+    - RDP 6.1: Better compression algorithms
+    - RDP 7.0+: RemoteFX, H.264 codec
+    - RDP 8.0+: Additional virtual channels
+    - RDP 10.x: Latest features
+
+    Support varies by feature - core protocol is fully supported, some advanced features are in progress.
+  </Accordion>
+
+  <Accordion title="What graphics codecs are supported?">
+    Supported codecs:
+
+    - **Uncompressed raw bitmaps**: Full support
+    - **Interleaved RLE**: Full support
+    - **RDP 6.0 Bitmap Compression**: Full support
+    - **Microsoft RemoteFX (RFX)**: Full support
+    - **H.264 (AVC420/AVC444)**: Partial support (decode only)
+
+    See crate `ironrdp-graphics` for implementation details.
+  </Accordion>
+
+  <Accordion title="How do I enable RemoteFX on the server?">
+    On Windows Server, run these PowerShell commands and reboot:
+
+    ```pwsh
+    Set-ItemProperty -Path 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services' `
+      -Name 'ColorDepth' -Type DWORD -Value 5
+
+    Set-ItemProperty -Path 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services' `
+      -Name 'fEnableVirtualizedGraphics' -Type DWORD -Value 1
+    ```
+
+    Or use Group Policy Editor (`gpedit.msc`) to enable RemoteFX settings under:
+    - Computer Configuration > Administrative Templates > Windows Components > Remote Desktop Services > Remote Desktop Session Host > Remote Session Environment
+  </Accordion>
+
+  <Accordion title="Where can I find the RDP protocol specifications?">
+    Microsoft publishes the RDP specifications as MS-RDP* documents:
+
+    - [MS-RDPBCGR](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/): Basic Connectivity and Graphics
+    - [MS-RDPECLIP](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpeclip/): Clipboard Virtual Channel
+    - [MS-RDPEFS](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpefs/): File System Virtual Channel
+    - [MS-RDPEA](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpea/): Audio Output Virtual Channel
+    - [MS-RDPEDISP](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpedisp/): Display Control Virtual Channel
+
+    All specifications are available on [Microsoft Open Specifications](https://learn.microsoft.com/en-us/openspecs/main/ms-winprotlp/e7cbbf79-8e1e-4568-a0db-1757d15e26ab).
+  </Accordion>
+</AccordionGroup>
+
+## Development Questions
+
+<AccordionGroup>
+  <Accordion title="How do I run the test suite?">
+    ```bash
+    # Run all tests
+    cargo xtask check tests -v
+
+    # Run tests for specific crate
+    cargo test -p ironrdp-pdu
+
+    # Run specific test
+    cargo test -p ironrdp-pdu test_name
+
+    # Run with logging
+    IRONRDP_LOG=debug cargo test -p ironrdp-connector
+
+    # Run full CI suite locally
+    cargo xtask ci -v
+    ```
+  </Accordion>
+
+  <Accordion title="How do I add a fuzz target?">
+    Create a new fuzz target in `fuzz/fuzz_targets/`:
+
+    ```rust
+    #![no_main]
+
+    use libfuzzer_sys::fuzz_target;
+    use ironrdp_pdu::MyPdu;
+    use ironrdp_core::{Decode, ReadCursor};
+
+    fuzz_target!(|data: &[u8]| {
+        let mut cursor = ReadCursor::new(data);
+        let _ = MyPdu::decode(&mut cursor);
+    });
+    ```
+
+    Add to `fuzz/Cargo.toml`:
+    ```toml
+    [[bin]]
+    name = "my_pdu"
+    path = "fuzz_targets/my_pdu.rs"
+    test = false
+    doc = false
+    ```
+
+    Run with:
+    ```bash
+    cargo xtask fuzz run my_pdu
+    ```
+  </Accordion>
+
+  <Accordion title="What tools are used for development?">
+    Key development tools:
+
+    - **cargo-nextest**: Faster test runner
+    - **cargo-deny**: Dependency license checking
+    - **typos**: Spell checker for code and docs
+    - **wasm-pack**: WebAssembly packaging
+    - **cargo-fuzz**: Fuzz testing (uses libFuzzer)
+    - **cargo xtask**: Project automation
+
+    Install with:
+    ```bash
+    cargo xtask bootstrap -v
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Need More Help?
+
+<CardGroup cols={2}>
+  <Card title="GitHub Issues" icon="github" href="https://github.com/Devolutions/IronRDP/issues">
+    Report bugs or request features
+  </Card>
+  <Card title="Matrix Chat" icon="comments" href="https://matrix.to/#/#IronRDP:matrix.org">
+    Chat with the community
+  </Card>
+  <Card title="Contributing Guide" icon="code-pull-request" href="/contributing">
+    Learn how to contribute
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/architecture/overview">
+    Understand the codebase structure
+  </Card>
+</CardGroup>

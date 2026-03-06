@@ -1,0 +1,358 @@
+---
+title: 'ironrdp-error'
+description: 'Lightweight generic error type for IronRDP'
+---
+
+# ironrdp-error
+
+A lightweight, `no_std`-compatible generic error type used throughout the IronRDP project.
+
+## Overview
+
+The `ironrdp-error` crate provides a flexible `Error<Kind>` type that combines a static context string with a user-defined error kind enum. It supports optional error chaining through source errors and works in `no_std` environments with or without allocation.
+
+**Source**: `crates/ironrdp-error/`
+
+## Features
+
+- **Generic Error Kind**: Parameterized by user-defined error kind enums
+- **Static Context**: Zero-allocation context strings using `&'static str`
+- **Source Chaining**: Optional error source tracking (requires `alloc` feature)
+- **`no_std` Support**: Works in embedded and bare-metal environments
+- **Conversion Support**: Convert between different error kinds
+
+## Feature Flags
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `std` | Yes | Enable standard library support and `std::error::Error` trait |
+| `alloc` | Enabled by `std` | Enable allocations for error sources (requires `alloc` crate) |
+
+## API Reference
+
+### Error\<Kind\>
+
+Generic error type combining context and kind.
+
+#### Construction
+
+```rust
+use ironrdp_error::Error;
+
+// Create new error with context and kind
+let error = Error::new("connection", MyErrorKind::Timeout);
+
+// Add source error for chaining
+let error = Error::new("connection", MyErrorKind::Timeout)
+    .with_source(std::io::Error::from(std::io::ErrorKind::TimedOut));
+```
+
+#### Methods
+
+```rust
+// Get the error kind
+fn kind(&self) -> &Kind
+
+// Update the context (useful when propagating)
+fn set_context(&mut self, context: &'static str)
+
+// Convert to different error kind
+fn into_other_kind<OtherKind>(self) -> Error<OtherKind>
+where
+    Kind: Into<OtherKind>
+
+// Get detailed error report (includes source chain)
+fn report(&self) -> ErrorReport<'_, Kind>
+```
+
+### ErrorReport
+
+Wrapper for formatted error output including full source chain.
+
+```rust
+// Display full error chain
+println!("{}", error.report());
+// Output: [connection] timeout, caused by: connection timed out
+```
+
+The `ErrorReport` type implements `Display` and formats the error with all causes in the chain.
+
+## Error Source Trait
+
+### Source Trait
+
+Abstraction over error sources that works in both `std` and `no_std` environments.
+
+```rust
+// With std feature
+pub trait Source: core::error::Error + Sync + Send + 'static {}
+
+// Without std feature
+pub trait Source: fmt::Display + fmt::Debug + Send + Sync + 'static {}
+```
+
+All types implementing the appropriate bounds automatically implement `Source`.
+
+## Usage Examples
+
+### Basic Error Handling
+
+```rust
+use ironrdp_error::Error;
+
+#[derive(Debug)]
+enum ConnectorErrorKind {
+    Negotiation,
+    Authentication,
+    Network,
+}
+
+impl std::fmt::Display for ConnectorErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Negotiation => write!(f, "protocol negotiation failed"),
+            Self::Authentication => write!(f, "authentication failed"),
+            Self::Network => write!(f, "network error"),
+        }
+    }
+}
+
+type ConnectorError = Error<ConnectorErrorKind>;
+
+fn establish_connection() -> Result<(), ConnectorError> {
+    // Error with static context
+    return Err(Error::new("establish_connection", ConnectorErrorKind::Negotiation));
+}
+
+match establish_connection() {
+    Ok(()) => println!("Connected"),
+    Err(e) => {
+        println!("Error: {}", e);
+        // Output: [establish_connection] protocol negotiation failed
+        println!("Kind: {:?}", e.kind());
+        // Output: Kind: Negotiation
+    }
+}
+```
+
+### Error Chaining
+
+```rust
+use ironrdp_error::Error;
+
+#[derive(Debug, thiserror::Error)]
+enum PduErrorKind {
+    #[error("encoding failed")]
+    Encode,
+    #[error("decoding failed")]
+    Decode,
+}
+
+type PduError = Error<PduErrorKind>;
+
+fn decode_packet(data: &[u8]) -> Result<(), PduError> {
+    // Parse operation that might fail
+    let result = bincode::deserialize::<Packet>(data)
+        .map_err(|e| Error::new("decode_packet", PduErrorKind::Decode)
+                          .with_source(e))?;
+    Ok(())
+}
+
+match decode_packet(&[]) {
+    Err(e) => {
+        // Full error report with source chain
+        eprintln!("Decode failed: {}", e.report());
+        // Output: [decode_packet] decoding failed, caused by: unexpected end of file
+    }
+    Ok(()) => {}
+}
+```
+
+### Converting Error Kinds
+
+```rust
+use ironrdp_error::Error;
+
+#[derive(Debug)]
+enum SpecificError {
+    Timeout,
+    InvalidData,
+}
+
+#[derive(Debug)]
+enum GeneralError {
+    Specific(SpecificError),
+    Unknown,
+}
+
+impl From<SpecificError> for GeneralError {
+    fn from(e: SpecificError) -> Self {
+        GeneralError::Specific(e)
+    }
+}
+
+fn handle_specific() -> Result<(), Error<SpecificError>> {
+    Err(Error::new("operation", SpecificError::Timeout))
+}
+
+fn handle_general() -> Result<(), Error<GeneralError>> {
+    // Convert error kind while preserving context and source
+    handle_specific()
+        .map_err(|e| e.into_other_kind())?;
+    Ok(())
+}
+```
+
+### `no_std` Usage
+
+```rust
+#![no_std]
+
+extern crate alloc;
+
+use ironrdp_error::Error;
+use alloc::string::String;
+
+#[derive(Debug)]
+enum EmbeddedError {
+    BufferFull,
+    InvalidState,
+}
+
+impl core::fmt::Display for EmbeddedError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::BufferFull => write!(f, "buffer is full"),
+            Self::InvalidState => write!(f, "invalid state"),
+        }
+    }
+}
+
+type Result<T> = core::result::Result<T, Error<EmbeddedError>>;
+
+fn process_packet() -> Result<()> {
+    Err(Error::new("process_packet", EmbeddedError::BufferFull))
+}
+```
+
+## Integration with IronRDP
+
+Throughout IronRDP, crates define their own error kind enums and use `ironrdp_error::Error` as the error type:
+
+### IronRDP Connector Errors
+
+```rust
+// From ironrdp-connector
+pub enum ConnectorErrorKind {
+    Encode(/* ... */),
+    Decode(/* ... */),
+    Credssp(/* ... */),
+    AccessDenied,
+    // ...
+}
+
+pub type ConnectorError = ironrdp_error::Error<ConnectorErrorKind>;
+```
+
+### IronRDP Session Errors
+
+```rust
+// From ironrdp-session
+pub enum SessionErrorKind {
+    Pdu(/* ... */),
+    Encode(/* ... */),
+    Decode(/* ... */),
+    // ...
+}
+
+pub type SessionError = ironrdp_error::Error<SessionErrorKind>;
+```
+
+### IronRDP PDU Errors
+
+```rust
+// From ironrdp-pdu
+pub enum PduErrorKind {
+    Unsupported { /* ... */ },
+    InvalidMessage { /* ... */ },
+    // ...
+}
+
+pub type PduError = ironrdp_error::Error<PduErrorKind>;
+```
+
+## Context Best Practices
+
+Context strings should:
+- Be lowercase snake_case or function names
+- Describe the operation that failed
+- Be static strings (zero allocation)
+- Be concise (used as a prefix)
+
+Good examples:
+- `"connect"`
+- `"send_request"`
+- `"decode_packet"`
+- `"establish_channel"`
+
+Avoid:
+- Complete sentences
+- Duplicating error kind information
+- Dynamic strings
+
+## Display Format
+
+The error displays as `[context] kind`:
+
+```rust
+let error = Error::new("parse_header", ParseError::InvalidMagic);
+println!("{}", error);
+// Output: [parse_header] invalid magic number
+
+println!("{}", error.report());
+// Output: [parse_header] invalid magic number, caused by: expected 0x52445000, found 0x00000000
+```
+
+## Conversion to `std::io::Error`
+
+When the `std` feature is enabled, `Error<Kind>` can be converted to `std::io::Error`:
+
+```rust
+use std::io;
+use ironrdp_error::Error;
+
+fn read_data() -> io::Result<Vec<u8>> {
+    let result: Result<Vec<u8>, Error<MyErrorKind>> = perform_read();
+    result.map_err(Into::into) // Converts to io::Error
+}
+```
+
+## Dependencies
+
+- **core**: Rust core library (always available)
+- **alloc**: Allocation support (optional, for error sources in `no_std`)
+
+## Related Crates
+
+All IronRDP crates use `ironrdp-error` for error handling:
+
+- `ironrdp-core`: Core encoding/decoding errors
+- `ironrdp-pdu`: PDU parsing errors
+- `ironrdp-connector`: Connection establishment errors
+- `ironrdp-session`: Session management errors
+- `ironrdp-svc`: Static virtual channel errors
+- `ironrdp-dvc`: Dynamic virtual channel errors
+
+## Design Rationale
+
+### Why Generic Error Kind?
+
+Rather than a single global error enum, `Error<Kind>` allows each crate to define its own error taxonomy while sharing the error infrastructure (context, sources, reporting).
+
+### Why Static Context?
+
+Static context strings have zero runtime cost and don't require allocations, making them suitable for performance-critical and `no_std` code paths.
+
+### Why Optional Sources?
+
+Error sources require allocation but provide valuable debugging information. Making them optional via feature flags allows usage in constrained environments while supporting rich error reports where possible.

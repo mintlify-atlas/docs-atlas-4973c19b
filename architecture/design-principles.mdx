@@ -1,0 +1,363 @@
+---
+title: Design Principles
+description: Architectural invariants and cross-cutting design decisions that shape IronRDP
+---
+
+## Introduction
+
+This document explains the **architectural invariants** and design principles that guide IronRDP development. These are not merely suggestions - they are enforced rules that ensure the codebase remains maintainable, secure, and performant.
+
+<Note>
+  An **architectural invariant** is a property that must hold true at all times. Violating these invariants can compromise security, portability, or the ability to maintain the codebase.
+</Note>
+
+## Core Principles
+
+### I/O Separation
+
+<Warning>
+  **Architecture Invariant**: Core tier crates must never interact with the outside world. Only extra tier crates such as `ironrdp-client`, `ironrdp-web`, or `ironrdp-async` are allowed to do I/O.
+</Warning>
+
+#### Why No I/O in Core?
+
+Separating protocol logic from I/O operations provides several critical benefits:
+
+1. **Testability**: Pure protocol logic can be tested deterministically without mocking sockets, files, or system calls
+2. **Fuzzing**: Fuzz targets can feed arbitrary byte sequences directly to protocol parsers without I/O overhead
+3. **Portability**: Core libraries work in any environment - embedded systems, WebAssembly, operating system kernels
+4. **Security**: Smaller attack surface by eliminating I/O-related vulnerabilities from protocol code
+
+#### Dependency Injection Pattern
+
+When runtime information is needed (hostname, current time, random values), use **dependency injection**:
+
+```rust
+// GOOD: Caller provides hostname
+fn create_connection_request(hostname: &str) -> ConnectionRequest {
+    ConnectionRequest { hostname: hostname.to_string() }
+}
+
+// BAD: Core tier crate calls gethostname()
+fn create_connection_request() -> ConnectionRequest {
+    let hostname = gethostname(); // ❌ System call in core tier!
+    ConnectionRequest { hostname }
+}
+```
+
+### No Platform-Dependent Code
+
+<Warning>
+  **Architecture Invariant**: Core tier crates must not contain platform-specific code (`#[cfg(windows)]`, `#[cfg(unix)]`, etc.).
+</Warning>
+
+The RDP protocol itself is platform-agnostic. Platform-specific implementations belong in **extra tier** crates:
+
+- `ironrdp-cliprdr-native` - native clipboard integration
+- `ironrdp-rdpdr-native` - native device redirection
+- `ironrdp-rdpsnd-native` - native audio output
+
+### `no_std` Compatibility
+
+<Warning>
+  **Architecture Invariant**: Core tier crates must be `#[no_std]`-compatible (optionally using the `alloc` crate). Standard library usage must be opt-in through a feature flag called `std` enabled by default. When `alloc` is optional, a feature flag called `alloc` must exist.
+</Warning>
+
+#### Feature Flag Pattern
+
+```toml
+[features]
+default = ["std"]
+std = ["alloc", "ironrdp-error/std"]
+alloc = ["ironrdp-error/alloc"]
+```
+
+**Rationale**: Enables use in embedded systems, bootloaders, kernel drivers, and constrained WebAssembly environments.
+
+## Quality Invariants
+
+### Mandatory Fuzzing
+
+<Warning>
+  **Architecture Invariant**: All core tier crates that handle untrusted input must be fuzzed. Fuzz targets must exist in the `fuzz/` directory.
+</Warning>
+
+RDP is a network protocol exposed to potentially malicious input. Fuzzing is **not optional** for security-critical parsing code.
+
+**Fuzz targets location**: `fuzz/`
+
+**Running fuzzing**:
+```bash
+cargo xtask fuzz install
+cargo xtask fuzz run
+```
+
+### Test at Boundaries
+
+<Info>
+  **Architecture Invariant**: Tests focus on **API boundaries** (public APIs of libraries) rather than implementation details.
+</Info>
+
+Most tests should live in:
+- `ironrdp-testsuite-core` - for core tier crates
+- `ironrdp-testsuite-extra` - for extra tier crates
+
+**Rationale**: Testing public APIs ensures that refactoring internal implementations doesn't require rewriting tests. It also validates what users actually interact with.
+
+### No External Dependencies in Tests
+
+<Warning>
+  **Architecture Invariant**: Tests do not depend on any kind of external resources. They are perfectly reproducible.
+</Warning>
+
+Tests must:
+- Not require internet connectivity
+- Not depend on specific file system structures
+- Not rely on system services or daemons
+- Be deterministic and repeatable
+
+**Good practices**:
+- Use `include_bytes!()` for test data
+- Use `expect-test` for snapshot testing
+- Use `proptest` for property-based testing with controlled randomness
+
+## Dependency Management
+
+### Minimal Dependencies in Core
+
+<Warning>
+  **Architecture Invariant**: Core tier crates may only include essential dependencies absolutely necessary for protocol implementation.
+</Warning>
+
+**Examples of acceptable dependencies**:
+- `bitflags` - efficient bit flag handling
+- `der-parser` - X.509 certificate parsing (required for RDP security)
+- Cryptographic primitives (`md5`, `sha1`)
+
+**Examples of unacceptable dependencies**:
+- HTTP clients
+- Logging frameworks (use `tracing` with dependency injection)
+- Serialization frameworks (implement `Encode`/`Decode` directly)
+
+### No Proc-Macro Dependencies
+
+<Warning>
+  **Architecture Invariant**: Core tier crates must not depend on proc-macros. Dependencies like `syn` should be pushed as far as possible from foundational crates.
+</Warning>
+
+**Rationale**: [Compilation time is a multiplier for everything](https://matklad.github.io/2021/09/04/fast-rust-builds.html#Why-Care-About-Build-Times). Proc-macros are a major compilation bottleneck. Research by [Google engineers shows](https://www.computer.org/csdl/magazine/so/2023/04/10176199/1OAJyfknInm) build latency significantly impacts developer productivity.
+
+**Exceptions**: `thiserror` may be used for error types, but only if the ergonomic benefit clearly outweighs the compilation cost.
+
+### No `[workspace.dependencies]` for External Crates
+
+<Warning>
+  Do not use `[workspace.dependencies]` for anything that is not workspace-internal (e.g., mostly dev-dependencies like `expect-test`, `proptest`, `rstest`).
+</Warning>
+
+**Rationale**: `release-plz` cannot detect that a dependency has been updated in a way warranting a version bump if no commit touches a file associated with the crate.
+
+### Phasing Out Legacy Dependencies
+
+<Warning>
+  **`num-derive` and `num-traits` are being phased out.** Do not introduce new usage of these crates.
+</Warning>
+
+## Performance Principles
+
+### Avoid Monomorphization Bloat
+
+<Warning>
+  **Architecture Invariant**: Unless the performance, usability, or ergonomic gain is really worth it, the amount of [monomorphization](https://rustc-dev-guide.rust-lang.org/backend/monomorph.html) incurred in downstream user code should be minimal to avoid binary bloating and to keep compilation as parallel as possible.
+</Warning>
+
+#### The Problem with Generic Code
+
+Rust uses **monomorphization** - generating separate machine code for each concrete type a generic function is called with. This provides excellent runtime performance but has costs:
+
+- **Compilation time**: Each instantiation is compiled separately
+- **Binary size**: Code is duplicated for each type
+- **Parallelism**: More units to compile can saturate the CPU
+
+#### Solution: Delegate to Dynamic Dispatch
+
+```rust
+// GOOD: Small generic wrapper delegates to dynamic dispatch
+pub fn frobnicate(f: impl FnMut()) {
+    frobnicate_impl(&mut f)
+}
+
+fn frobnicate_impl(f: &mut dyn FnMut()) {
+    // Large function body here
+    // This is only compiled once
+}
+
+// BAD: Large generic function is monomorphized for every caller
+pub fn frobnicate(f: impl FnMut()) {
+    // Hundreds of lines of generic code
+    // Compiled separately for every type F
+}
+```
+
+#### Avoid Premature Polymorphism
+
+```rust
+// GOOD: Accept concrete type
+fn process_path(path: &Path) { /* ... */ }
+
+// BAD: Unnecessary generic overhead for a widely-used crate
+fn process_path(path: impl AsRef<Path>) { /* ... */ }
+```
+
+**Exception**: `AsRef` polymorphism may be worth it for widely-used libraries where ergonomics matter significantly.
+
+### Allocation Awareness
+
+Avoid unnecessary allocations, especially in hot paths:
+
+```rust
+// GOOD: Iterator-based solution
+let second_word = text.split(' ').nth(1)?;
+
+// BAD: Allocates intermediate Vec
+let words: Vec<&str> = text.split(' ').collect();
+let second_word = words.get(1)?;
+```
+
+**Principle**: Push allocations to the call site where the caller can decide if allocation is necessary.
+
+### Zero-Copy Parsing
+
+Use `ReadCursor` and `WriteCursor` for efficient, `no_std`-compatible I/O:
+
+```rust
+pub trait Decode: Sized {
+    fn decode(src: &mut ReadCursor<'_>) -> Result<Self, Self::Error>;
+}
+```
+
+This allows parsing without intermediate allocations or copies.
+
+## CI/CD Invariants
+
+### Local CI Equivalence
+
+<Warning>
+  **Architecture Invariant**: `cargo xtask ci` and the CI workflow must be logically equivalent. A successful `cargo xtask ci` run implies a successful CI workflow run and vice versa.
+</Warning>
+
+**Rationale**: Developers should be able to validate their changes locally with confidence before pushing.
+
+**Usage**:
+```bash
+# Run full CI suite
+cargo xtask ci
+
+# Run individual checks
+cargo xtask check fmt
+cargo xtask check lints
+cargo xtask check tests
+cargo xtask check locks
+```
+
+### Test Suite Isolation
+
+<Warning>
+  **Architectural Invariant** (for `ironrdp-testsuite-core`): No dependency from another tier is allowed. Compiling and running the core test suite must not require building any library from the extra tier.
+</Warning>
+
+**Rationale**: Keeps iteration time short when working on core protocol logic.
+
+## Error Handling Standards
+
+### Error Type Requirements
+
+Following Rust conventions:
+
+- **Libraries**: Use concrete error types (hand-crafted or `thiserror`)
+- **Binaries**: Use `anyhow::Error` for catch-all error handling
+
+### Error Message Formatting
+
+<Info>
+  Error messages must be:
+  - Short and concise
+  - Lowercase (no capital letter at start)
+  - No trailing punctuation
+</Info>
+
+**Good**:
+```rust
+"invalid X.509 certificate"
+"unexpected ASN.1 DER tag"
+```
+
+**Bad**:
+```rust
+"Invalid X.509 certificate."  // Capital letter + period
+"Unexpected ASN.1 DER tag: expected SEQUENCE, got CONTEXT-SPECIFIC [19] (primitive)"  // Too long, should be split
+```
+
+**Rationale**: Error messages are composed together in error chains. The error reporter adds punctuation and capitalization.
+
+## API Boundary Rules
+
+Certain crates are designated as **API Boundaries** - public interfaces that external code depends on:
+
+### Core Tier (All are API Boundaries)
+- `ironrdp` (meta crate)
+- `ironrdp-core`
+- `ironrdp-pdu`
+- `ironrdp-connector`
+- `ironrdp-session`
+- And others (see [Crate Tiers](/architecture/crate-tiers))
+
+### Extra Tier (Selected)
+- `ironrdp-blocking`
+- `ironrdp-async`
+- `ironrdp-tokio`
+- `ironrdp-futures`
+- `ironrdp-web` (WASM module)
+
+### Special Considerations at Boundaries
+
+<Note>
+  Remember: [Rules at the boundary are different](https://www.tedinski.com/2018/02/06/system-boundaries.html)
+</Note>
+
+At API boundaries:
+- **Breaking changes** require careful consideration and major version bumps
+- **Documentation** must be comprehensive
+- **Performance** characteristics become public contract
+- **Error types** become part of the API
+
+## Internal Tier Boundaries
+
+<Warning>
+  **Architecture Invariant**: Internal tier crates are not, and will never be, an **API Boundary**. They may change without notice.
+</Warning>
+
+Internal crates (`ironrdp-testsuite-*`, `ironrdp-fuzzing`, `xtask`) are free to change as needed for project maintenance.
+
+## Summary
+
+These design principles ensure IronRDP remains:
+
+✅ **Secure** - through mandatory fuzzing and small attack surface  
+✅ **Portable** - via `no_std` support and I/O separation  
+✅ **Maintainable** - with clear boundaries and minimal dependencies  
+✅ **Fast to compile** - by avoiding monomorphization and proc-macros  
+✅ **Testable** - through deterministic, reproducible tests  
+
+When in doubt, refer back to these principles and the [ARCHITECTURE.md](https://github.com/Devolutions/IronRDP/blob/master/ARCHITECTURE.md) document in the repository.
+
+## Further Reading
+
+<CardGroup cols={2}>
+  <Card title="Architecture Overview" icon="sitemap" href="/architecture/overview">
+    High-level architecture and design philosophy
+  </Card>
+  <Card title="Crate Tiers" icon="layer-group" href="/architecture/crate-tiers">
+    Detailed breakdown of each tier and its crates
+  </Card>
+</CardGroup>

@@ -1,0 +1,340 @@
+---
+title: ironrdp-pdu
+description: RDP Protocol Data Unit (PDU) encoding and decoding
+---
+
+<Note>
+**Version:** 0.7.0  
+**Docs.rs:** [ironrdp-pdu](https://docs.rs/ironrdp-pdu/latest/ironrdp_pdu/)
+</Note>
+
+## Overview
+
+The `ironrdp-pdu` crate provides structures and functions for encoding and decoding RDP Protocol Data Units. This crate implements the binary protocol layer for:
+
+- Connection negotiation (X.224, MCS)
+- Graphics and input PDUs
+- Virtual channel messages
+- Fast-path and legacy transport
+
+## Key Modules
+
+### Connection & Negotiation
+
+- `nego` - Initial protocol negotiation (CredSSP, TLS, RDP security)
+- `x224` - X.224 connection-oriented transport
+- `tpkt` - TPKT framing headers
+- `tpdu` - T.125 transport PDUs
+- `mcs` - Multipoint Communication Service layer
+- `gcc` - Generic Conference Control (client/server data blocks)
+
+### Core Protocol
+
+- `rdp` - Core RDP PDUs (client info, capability sets, licensing)
+- `rdp::vc` - Virtual channel PDU headers
+- `rdp::capability_sets` - Capability negotiation structures
+
+### Graphics & Input
+
+- `input` - Keyboard, mouse, and synchronization events
+- `input::fast_path` - Fast-path input encoding
+- `fast_path` - Fast-path output decoding
+- `bitmap` - Bitmap compression and encoding
+- `surface_commands` - Graphics surface commands
+- `pointer` - Pointer (cursor) definitions
+- `codecs` - Image compression codecs (RFX, etc.)
+- `geometry` - Rectangle and region structures
+
+### Dynamic Channels
+
+- `dvc` - Dynamic Virtual Channel (DRDYNVC) PDUs
+
+## Core Types
+
+### Result & Error
+
+```rust
+pub type PduResult<T> = Result<T, PduError>;
+pub type PduError = ironrdp_error::Error<PduErrorKind>;
+
+#[non_exhaustive]
+pub enum PduErrorKind {
+    Encode,
+    Decode,
+    Other { description: &'static str },
+}
+```
+
+### PDU Detection
+
+```rust
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum Action {
+    FastPath = 0x00,
+    X224 = 0x03,
+}
+
+pub struct PduInfo {
+    pub action: Action,
+    pub length: usize,
+}
+
+// Detect PDU type and size from header bytes
+pub fn find_size(bytes: &[u8]) -> DecodeResult<Option<PduInfo>>
+```
+
+**Example:**
+
+```rust
+use ironrdp_pdu::{find_size, Action};
+
+let bytes = &[0x03, 0x00, 0x00, 0x13]; // X224 PDU
+let info = find_size(bytes)?.unwrap();
+assert_eq!(info.action, Action::X224);
+assert_eq!(info.length, 0x13);
+```
+
+### PDU Hints
+
+```rust
+pub trait PduHint: Send + Sync + fmt::Debug + 'static {
+    fn find_size(&self, bytes: &[u8]) -> DecodeResult<Option<(bool, usize)>>;
+}
+
+pub const RDP_HINT: RdpHint;      // Matches both X224 and FastPath
+pub const X224_HINT: X224Hint;    // Matches only X224
+pub const FAST_PATH_HINT: FastPathHint; // Matches only FastPath
+```
+
+Use hints with framing code to detect PDU boundaries.
+
+## Negotiation PDUs
+
+### X.224 Connection Request
+
+```rust
+use ironrdp_pdu::x224::*;
+use ironrdp_pdu::nego::*;
+
+let request = ConnectionRequest {
+    cookie: Some(Cookie::from_bytes(b"Cookie: mstshash=user\r\n")),
+    negotiation_request: Some(NegotiationRequest::new(
+        NegoData::default(),
+        SecurityProtocol::HYBRID | SecurityProtocol::SSL,
+    )),
+};
+```
+
+### Client Info PDU
+
+```rust
+use ironrdp_pdu::rdp::ClientInfoPdu;
+use ironrdp_pdu::rdp::client_info::*;
+
+let info = ClientInfoPdu {
+    credentials: Credentials::UsernamePassword {
+        username: "user".into(),
+        password: "pass".into(),
+        domain: Some("DOMAIN".into()),
+    },
+    client_name: "WORKSTATION".into(),
+    client_dir: "C:\\Windows\\System32\\mstsc.exe".into(),
+    // ... other fields
+};
+```
+
+See `ironrdp-connector` for higher-level connection APIs.
+
+## Graphics PDUs
+
+### Fast-Path Output
+
+```rust
+use ironrdp_pdu::fast_path::*;
+
+pub enum FastPathUpdatePdu {
+    Orders(UpdateOrdersPdu),
+    Bitmap(UpdateBitmapPdu),
+    Palette(UpdatePalettePdu),
+    Synchronize,
+    SurfaceCommands(SurfaceCommandsPdu),
+    // ...
+}
+```
+
+### Bitmap Data
+
+```rust
+use ironrdp_pdu::bitmap::*;
+
+pub struct BitmapData {
+    pub left: u16,
+    pub top: u16,
+    pub width: u16,
+    pub height: u16,
+    pub bits_per_pixel: u16,
+    pub compression_flags: CompressionFlags,
+    pub bitmap_data: Vec<u8>,
+}
+```
+
+## Input PDUs
+
+### Fast-Path Input
+
+```rust
+use ironrdp_pdu::input::fast_path::*;
+
+pub enum FastPathInputEvent {
+    KeyboardEvent(KeyboardFlags, u8),
+    MouseEvent(MousePdu),
+    MouseEventEx(MouseXPdu),
+    SyncEvent(SynchronizeFlags),
+    UnicodeKeyboardEvent(KeyboardFlags, u16),
+    QoeEvent(QoeEvent),
+}
+```
+
+**Example:**
+
+```rust
+use ironrdp_pdu::input::fast_path::*;
+
+let events = vec![
+    FastPathInputEvent::KeyboardEvent(KeyboardFlags::empty(), 0x1E), // 'A' key down
+    FastPathInputEvent::KeyboardEvent(KeyboardFlags::RELEASE, 0x1E), // 'A' key up
+];
+```
+
+See [ironrdp-input](/api/ironrdp-input) for higher-level input event builders.
+
+## Design Patterns
+
+### Plain Old Data Structures
+
+Most PDUs are simple structs with public fields:
+
+```rust
+pub struct DesktopSize {
+    pub width: u16,
+    pub height: u16,
+}
+```
+
+This enables:
+- Pattern matching
+- Field struct expressions
+- Functional update syntax
+- Moving individual fields
+
+### Resilient Parsing with Newtype Enums
+
+Instead of Rust enums, protocol codes use newtype structs:
+
+```rust
+pub struct FailureCode(u32);
+
+impl FailureCode {
+    pub const SSL_REQUIRED_BY_SERVER: Self = Self(0x0000_0001);
+    pub const SSL_NOT_ALLOWED_BY_SERVER: Self = Self(0x0000_0002);
+    // ...
+}
+```
+
+This allows:
+- Forward compatibility (unknown values are preserved)
+- Round-trip encoding (`decode(encode(x)) == x`)
+- Non-destructive parsing
+
+See the [README](https://github.com/Devolutions/IronRDP/tree/master/crates/ironrdp-pdu) section on "Enumeration-like types" for rationale.
+
+### Bit Flags
+
+```rust
+use bitflags::bitflags;
+
+bitflags! {
+    pub struct SecurityProtocol: u32 {
+        const SSL = 0x0000_0001;
+        const HYBRID = 0x0000_0002;
+        const HYBRID_EX = 0x0000_0008;
+        const _ = !0; // Accept unknown flags
+    }
+}
+
+// Use from_bits_retain() to preserve unknown bits
+let flags = SecurityProtocol::from_bits_retain(raw_value);
+```
+
+The `const _ = !0` pattern enables resilient flag parsing.
+
+## Encoding Utilities
+
+### UTF-16 Strings
+
+```rust
+use ironrdp_pdu::utf16::*;
+
+pub fn encode_utf16_with_null(s: &str) -> Vec<u16>;
+pub fn decode_utf16(data: &[u16]) -> Result<String, FromUtf16Error>;
+```
+
+### Padding
+
+```rust
+use ironrdp_core::padding::*;
+
+let padded_size = padding::compute_padded_size(actual_size, alignment);
+```
+
+## Features
+
+<ParamField path="std" type="feature">
+Enables standard library support (includes `alloc`)
+</ParamField>
+
+<ParamField path="alloc" type="feature">
+Enables heap allocations
+</ParamField>
+
+<ParamField path="qoi" type="feature">
+Enable QOI image codec support
+</ParamField>
+
+<ParamField path="qoiz" type="feature">
+Enable QOI + Zstd compressed image support
+</ParamField>
+
+## Usage Notes
+
+<Note>
+**Temporary Re-exports:**  
+ironrdp-pdu currently re-exports ironrdp-core types for backwards compatibility:
+
+```rust
+pub use ironrdp_core::*; // Deprecated, use ironrdp_core directly
+```
+
+New code should import from `ironrdp_core` directly.
+</Note>
+
+<Note>
+**Size Constants:**  
+When computing PDU sizes, annotate each addend:
+
+```rust
+const SIZE: usize = 
+    1  /* version */ +
+    2  /* length */ +
+    4  /* flags */;
+```
+
+This makes the size calculation self-documenting.
+</Note>
+
+## See Also
+
+- [ironrdp-core](/api/ironrdp-core) - Core encoding/decoding traits
+- [ironrdp-graphics](/api/ironrdp-graphics) - Image processing
+- [ironrdp-connector](/api/ironrdp-connector) - Connection state machines
+- [MS-RDPBCGR](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/) - RDP protocol specification

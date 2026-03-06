@@ -1,0 +1,255 @@
+---
+title: ironrdp-client
+description: Portable RDP client without GPU acceleration
+---
+
+## Overview
+
+`ironrdp-client` is a full-fledged, portable RDP client built on the IronRDP crates suite. It provides a complete RDP client implementation using non-blocking, asynchronous I/O with softbuffer for rendering and winit for windowing.
+
+**Key Features:**
+- Full RDP client functionality without GPU acceleration
+- Cross-platform windowing via winit
+- Software rendering via softbuffer
+- Async/await architecture with Tokio runtime
+- Support for dynamic virtual channels (DVC)
+- Native clipboard integration
+- Audio playback support
+- WebSocket gateway support
+
+## Installation
+
+```toml
+[dependencies]
+ironrdp-client = "0.1.0"
+```
+
+### Features
+
+- **`rustls`** (default): Use rustls for TLS (recommended)
+- **`native-tls`**: Use native TLS implementation
+- **`qoi`**: Enable QOI image codec
+- **`qoiz`**: Enable QOIZ compressed image codec
+
+## Usage
+
+### Basic Connection
+
+```bash
+ironrdp-client <HOSTNAME> --username <USERNAME> --password <PASSWORD>
+```
+
+### Configuration Options
+
+The client can be configured via command-line arguments:
+
+```bash
+ironrdp-client 192.168.1.100 \
+  --username admin \
+  --password secret \
+  --width 1920 \
+  --height 1080 \
+  --domain CONTOSO
+```
+
+## Architecture
+
+### Core Modules
+
+#### `app`
+Window management and event handling using winit. Manages:
+- Window creation and lifecycle
+- Input event capture (keyboard, mouse)
+- Display buffer rendering via softbuffer
+- Dynamic window resizing
+
+#### `rdp`
+RDP protocol handling:
+- Connection establishment
+- Active session management
+- Graphics update processing
+- Input event encoding and transmission
+
+#### `config`
+Configuration management:
+- Command-line argument parsing
+- Connector configuration building
+- Credential management
+- Display settings
+
+#### `clipboard`
+Clipboard integration:
+- Native clipboard backend
+- Format conversion
+- Bidirectional clipboard sync
+
+#### `ws`
+WebSocket gateway support for connecting through RD Gateway.
+
+## Configuration
+
+### Logging
+
+Set the `IRONRDP_LOG` environment variable to configure log filtering:
+
+```bash
+IRONRDP_LOG="info,ironrdp_connector=trace" ironrdp-client <hostname> -u <username> -p <password>
+```
+
+Supports standard tracing-subscriber filter directives.
+
+### TLS Key Logging
+
+For debugging TLS connections with Wireshark:
+
+```bash
+SSLKEYLOGFILE=/tmp/tls-secrets ironrdp-client <hostname> -u <username> -p <password>
+```
+
+This dumps TLS encryption secrets to the specified file for packet decryption.
+
+## Building Custom Clients
+
+The `ironrdp-client` crate can be used as a library to build custom RDP clients:
+
+```rust
+use ironrdp_client::config::Config;
+use ironrdp_client::rdp::RdpClient;
+
+// Configure connection
+let config = Config {
+    destination: Destination::new("192.168.1.100")?,
+    connector: connector::Config {
+        credentials: Credentials::UsernamePassword {
+            username: "admin".to_string(),
+            password: "password".to_string(),
+        },
+        desktop_size: connector::DesktopSize {
+            width: 1920,
+            height: 1080,
+        },
+        // ... other settings
+    },
+    // ... other config
+};
+
+// Create and run client
+let mut client = RdpClient::new(config).await?;
+client.run().await?;
+```
+
+## Platform Support
+
+The client supports multiple platforms through conditional compilation:
+
+- **Windows**: Full support including COM-based DVC plugins
+- **macOS**: Core functionality
+- **Linux**: Core functionality
+- **Other Unix**: Core functionality
+
+### Windows-Specific Features
+
+On Windows, the client supports loading DVC plugins via COM:
+
+```rust
+#[cfg(windows)]
+pub dvc_plugins: Vec<PathBuf>
+```
+
+Example: Load WebAuthn plugin:
+
+```bash
+ironrdp-client <hostname> -u <username> -p <password> \
+  --dvc-plugin "C:\\Windows\\System32\\webauthn.dll"
+```
+
+## Advanced Features
+
+### Dynamic Virtual Channels
+
+The client supports DVC named pipe proxies for custom channel implementations:
+
+```rust
+pub struct DvcProxyInfo {
+    pub channel_name: String,
+    pub pipe_name: String,
+}
+```
+
+This enables proxying DVC messages to external processes via named pipes.
+
+### Clipboard Types
+
+Choose clipboard backend:
+
+```bash
+--clipboard default  # Platform-native clipboard
+--clipboard stub     # No-op clipboard (testing)
+--clipboard windows  # Windows-specific (Windows only)
+--clipboard none     # Disable clipboard
+```
+
+### RDCleanPath
+
+Support for Microsoft RDCleanPath drive redirection:
+
+```rust
+pub struct RDCleanPathConfig {
+    // Configuration for drive redirection
+}
+```
+
+## Example: Screenshot Client
+
+The IronRDP repository includes a screenshot example demonstrating blocking I/O usage:
+
+```rust
+// From examples/screenshot.rs
+use ironrdp::connector::{self, Credentials, ConnectionResult};
+use ironrdp::session::{ActiveStage, ActiveStageOutput};
+use ironrdp::session::image::DecodedImage;
+
+let connector_config = connector::Config {
+    credentials: Credentials::UsernamePassword { 
+        username, 
+        password 
+    },
+    desktop_size: connector::DesktopSize {
+        width: 1280,
+        height: 1024,
+    },
+    // ... configure other settings
+};
+
+// Connect and capture screenshot
+let (connection_result, framed) = connect(connector_config, host, port)?;
+let mut image = DecodedImage::new(
+    PixelFormat::RgbA32,
+    connection_result.desktop_size.width,
+    connection_result.desktop_size.height,
+);
+
+active_stage(connection_result, framed, &mut image)?;
+image.save("screenshot.png")?;
+```
+
+See `crates/ironrdp/examples/screenshot.rs` for the complete implementation.
+
+## Performance Considerations
+
+- **Software Rendering**: Uses softbuffer for CPU-based rendering (no GPU acceleration)
+- **Async I/O**: Non-blocking I/O with Tokio for efficient network operations
+- **Memory Usage**: Buffers framebuffer in memory for rendering
+
+## Related Crates
+
+- [`ironrdp`](/api/ironrdp) - Core RDP protocol implementation
+- [`ironrdp-connector`](/api/ironrdp-connector) - Connection establishment
+- [`ironrdp-session`](/api/ironrdp-session) - Active session management
+- [`ironrdp-graphics`](/api/ironrdp-graphics) - Graphics processing
+- [`ironrdp-tokio`](/api/ironrdp-tokio) - Async runtime integration
+
+## See Also
+
+- [Examples](/examples) - More usage examples
+- [RDP Specification](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/) - Microsoft RDP protocol documentation

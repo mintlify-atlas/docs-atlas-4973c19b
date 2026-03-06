@@ -1,0 +1,460 @@
+---
+title: Virtual Channels
+description: Implement RDP virtual channels for clipboard, audio, file transfer, and custom protocols
+---
+
+RDP virtual channels enable extending the protocol with custom functionality. IronRDP supports both **static virtual channels (SVC)** and **dynamic virtual channels (DVC)**, along with built-in implementations for common channels.
+
+## Channel Types
+
+### Static Virtual Channels (SVC)
+
+Established during connection setup. Examples:
+- `CLIPRDR` - Clipboard redirection
+- `RDPSND` - Audio output
+- `RDPDR` - Device redirection
+- `DRDYNVC` - Dynamic channel transport
+
+### Dynamic Virtual Channels (DVC)
+
+Created on-demand over the `DRDYNVC` static channel. More flexible for custom protocols.
+
+## Built-in Channels
+
+### Clipboard (CLIPRDR)
+
+The clipboard channel enables copy/paste between client and server.
+
+#### Client-side Implementation
+
+```rust
+use ironrdp::cliprdr::backend::{CliprdrBackend, CliprdrBackendFactory};
+use ironrdp_cliprdr_native::NativeCliprdrBackend;
+
+struct MyCliprdrFactory;
+
+impl CliprdrBackendFactory for MyCliprdrFactory {
+    fn build_cliprdr_backend(&self) -> Box<dyn CliprdrBackend> {
+        // Use native clipboard integration
+        Box::new(NativeCliprdrBackend::new())
+    }
+}
+```
+
+#### Server-side Implementation
+
+```rust
+use ironrdp::server::{CliprdrServerFactory, ServerEventSender, ServerEvent};
+use ironrdp::server::tokio::sync::mpsc::UnboundedSender;
+use ironrdp_cliprdr_native::StubCliprdrBackend;
+
+struct ServerCliprdrFactory;
+
+impl CliprdrBackendFactory for ServerCliprdrFactory {
+    fn build_cliprdr_backend(&self) -> Box<dyn CliprdrBackend> {
+        Box::new(StubCliprdrBackend::new())
+    }
+}
+
+impl ServerEventSender for ServerCliprdrFactory {
+    fn set_sender(&mut self, _sender: UnboundedSender<ServerEvent>) {}
+}
+
+impl CliprdrServerFactory for ServerCliprdrFactory {}
+
+// Add to server builder
+let cliprdr = Box::new(ServerCliprdrFactory);
+let server = server_builder
+    .with_cliprdr_factory(Some(cliprdr))
+    .build();
+```
+
+#### Custom Clipboard Backend
+
+Implement your own clipboard logic:
+
+```rust
+use ironrdp::cliprdr::backend::CliprdrBackend;
+use ironrdp::cliprdr::pdu::*;
+
+struct MyClipboard {
+    content: Vec<u8>,
+}
+
+impl CliprdrBackend for MyClipboard {
+    fn capabilities(&self) -> anyhow::Result<ClipboardCapabilitiesPdu> {
+        Ok(ClipboardCapabilitiesPdu::new(vec![
+            ClipboardCapability::GeneralCapability(GeneralCapabilitySet {
+                version: ClipboardProtocolVersion::V2,
+                general_flags: GeneralCapabilityFlags::default(),
+            }),
+        ]))
+    }
+
+    fn format_list(&mut self, pdu: &FormatListPdu) -> anyhow::Result<()> {
+        // Handle incoming format list from peer
+        for format in &pdu.formats {
+            println!("Available format: {} ({})", format.id, format.name);
+        }
+        Ok(())
+    }
+
+    fn format_data_request(&mut self, pdu: &FormatDataRequestPdu) -> anyhow::Result<FormatDataResponsePdu> {
+        // Return clipboard data for requested format
+        Ok(FormatDataResponsePdu {
+            data: self.content.clone(),
+        })
+    }
+
+    fn format_data_response(&mut self, pdu: &FormatDataResponsePdu) -> anyhow::Result<()> {
+        // Receive clipboard data from peer
+        self.content = pdu.data.clone();
+        Ok(())
+    }
+}
+```
+
+### Audio Output (RDPSND)
+
+Stream audio from server to client.
+
+#### Server Implementation
+
+```rust
+use ironrdp::rdpsnd::pdu::*;
+use ironrdp::rdpsnd::server::{RdpsndServerHandler, RdpsndServerMessage};
+use ironrdp::server::{SoundServerFactory, ServerEvent};
+
+struct AudioHandler {
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl RdpsndServerHandler for AudioHandler {
+    fn get_formats(&self) -> &[AudioFormat] {
+        &[
+            AudioFormat {
+                format: WaveFormat::PCM,
+                n_channels: 2,
+                n_samples_per_sec: 44100,
+                n_avg_bytes_per_sec: 176400,
+                n_block_align: 4,
+                bits_per_sample: 16,
+                data: None,
+            },
+            AudioFormat {
+                format: WaveFormat::OPUS,
+                n_channels: 2,
+                n_samples_per_sec: 48000,
+                n_avg_bytes_per_sec: 192000,
+                n_block_align: 4,
+                bits_per_sample: 16,
+                data: None,
+            },
+        ]
+    }
+
+    fn start(&mut self, client_format: &ClientAudioFormatPdu) -> Option<u16> {
+        // Client selected a format, start streaming
+        let format_index = 0; // Index into get_formats()
+
+        // Spawn audio streaming task
+        self.task = Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(20));
+            loop {
+                interval.tick().await;
+                // Generate and send audio samples
+            }
+        }));
+
+        Some(format_index)
+    }
+
+    fn stop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+```
+
+#### Sending Audio Frames
+
+```rust
+use ironrdp::server::ServerEvent;
+
+// From your audio streaming task:
+let audio_data = vec![0u8; 1024]; // PCM samples
+let timestamp: u16 = 0; // Incrementing timestamp
+
+sender.send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(
+    audio_data,
+    timestamp,
+)))?;
+```
+
+### Device Redirection (RDPDR)
+
+Redirect local devices (drives, printers, serial ports) to the remote session.
+
+```rust
+use ironrdp::rdpdr::pdu::*;
+
+// RDPDR implementation is more complex
+// See crates/ironrdp-rdpdr for full details
+```
+
+## Implementing Custom Static Channels
+
+### Define Channel Trait
+
+```rust
+use ironrdp_svc::{SvcProcessor, SvcProcessorMessages, SvcMessage};
+
+struct MyCustomChannel {
+    // Channel state
+}
+
+impl SvcProcessor for MyCustomChannel {
+    fn channel_name(&self) -> &str {
+        "MYCHAN" // 8 characters max
+    }
+
+    fn process(&mut self, payload: &[u8]) -> anyhow::Result<SvcProcessorMessages> {
+        // Decode incoming PDU
+        let message = parse_my_protocol(payload)?;
+
+        // Process message
+        let response = self.handle_message(message)?;
+
+        // Return response PDUs
+        Ok(vec![SvcMessage {
+            channel_name: self.channel_name().to_owned(),
+            data: encode_my_protocol(response)?,
+        }])
+    }
+}
+```
+
+### Register Channel
+
+Channels are registered during connection setup through the connector configuration:
+
+```rust
+use ironrdp::connector::Config;
+
+let mut config = Config {
+    // ... other config
+    request_data: Some(vec!["MYCHAN".to_owned()]),
+    // ...
+};
+```
+
+## Implementing Dynamic Channels (DVC)
+
+### Client-side DVC
+
+```rust
+use ironrdp::dvc::{DvcProcessor, DvcMessage};
+use ironrdp_core::{ReadCursor, WriteBuf};
+
+struct MyDvcChannel;
+
+impl DvcProcessor for MyDvcChannel {
+    fn channel_name(&self) -> &str {
+        "my.custom.dvc"
+    }
+
+    fn start(&mut self, channel_id: u32) -> anyhow::Result<()> {
+        println!("DVC channel started with ID: {}", channel_id);
+        Ok(())
+    }
+
+    fn process(&mut self, payload: &[u8]) -> anyhow::Result<Vec<DvcMessage>> {
+        let mut cursor = ReadCursor::new(payload);
+
+        // Parse your custom protocol
+        let message_type = cursor.read_u8()?;
+        let data_length = cursor.read_u32()?;
+        let data = cursor.read_slice(data_length as usize)?;
+
+        // Handle message
+        match message_type {
+            1 => self.handle_data_message(data)?,
+            2 => self.handle_control_message(data)?,
+            _ => anyhow::bail!("unknown message type"),
+        }
+
+        // Return response messages
+        Ok(vec![])
+    }
+
+    fn close(&mut self) -> anyhow::Result<()> {
+        println!("DVC channel closed");
+        Ok(())
+    }
+}
+```
+
+### Creating DVC Messages
+
+```rust
+use ironrdp::dvc::DvcMessage;
+use ironrdp_core::WriteBuf;
+
+fn create_dvc_message() -> anyhow::Result<DvcMessage> {
+    let mut buf = WriteBuf::new();
+
+    buf.write_u8(1)?; // Message type
+    buf.write_u32(100)?; // Data length
+    buf.write_slice(&[0u8; 100])?; // Payload
+
+    Ok(DvcMessage {
+        channel_name: "my.custom.dvc".to_owned(),
+        data: buf.into_inner(),
+    })
+}
+```
+
+## Channel Processing Patterns
+
+### Stateful Channel
+
+```rust
+struct StatefulChannel {
+    state: ChannelState,
+    pending_requests: HashMap<u32, PendingRequest>,
+}
+
+enum ChannelState {
+    Initializing,
+    Ready,
+    Closed,
+}
+
+impl SvcProcessor for StatefulChannel {
+    fn process(&mut self, payload: &[u8]) -> anyhow::Result<SvcProcessorMessages> {
+        match self.state {
+            ChannelState::Initializing => {
+                // Handle initialization messages
+                self.state = ChannelState::Ready;
+                Ok(vec![])
+            }
+            ChannelState::Ready => {
+                // Normal message processing
+                self.handle_ready_message(payload)
+            }
+            ChannelState::Closed => {
+                anyhow::bail!("channel is closed")
+            }
+        }
+    }
+}
+```
+
+### Request-Response Channel
+
+```rust
+struct RequestResponseChannel {
+    next_request_id: u32,
+}
+
+impl RequestResponseChannel {
+    fn send_request(&mut self, data: Vec<u8>) -> u32 {
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+
+        // Encode request with ID
+        let mut buf = WriteBuf::new();
+        buf.write_u32(request_id).unwrap();
+        buf.write_slice(&data).unwrap();
+
+        request_id
+    }
+
+    fn handle_response(&mut self, payload: &[u8]) -> anyhow::Result<()> {
+        let mut cursor = ReadCursor::new(payload);
+        let request_id = cursor.read_u32()?;
+        let response_data = cursor.remaining();
+
+        println!("Received response for request {}", request_id);
+        Ok(())
+    }
+}
+```
+
+## Best Practices
+
+### Error Handling
+
+```rust
+use ironrdp_error::{Error, ErrorKind};
+
+#[derive(Debug)]
+enum MyChannelError {
+    InvalidMessage,
+    ProtocolViolation,
+}
+
+impl std::fmt::Display for MyChannelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidMessage => write!(f, "invalid message"),
+            Self::ProtocolViolation => write!(f, "protocol violation"),
+        }
+    }
+}
+```
+
+### Logging
+
+```rust
+use tracing::{debug, trace, warn};
+
+impl SvcProcessor for MyChannel {
+    fn process(&mut self, payload: &[u8]) -> anyhow::Result<SvcProcessorMessages> {
+        trace!(len = payload.len(), "received channel message");
+
+        match self.decode_message(payload) {
+            Ok(msg) => {
+                debug!(?msg, "processing message");
+                self.handle_message(msg)
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to decode message");
+                Err(e)
+            }
+        }
+    }
+}
+```
+
+### Buffer Management
+
+Use `WriteBuf` and `ReadCursor` for efficient encoding/decoding:
+
+```rust
+use ironrdp_core::{WriteBuf, ReadCursor};
+
+fn encode_message(msg: &MyMessage) -> anyhow::Result<Vec<u8>> {
+    let mut buf = WriteBuf::new();
+    buf.write_u16(msg.message_type)?;
+    buf.write_u32(msg.data.len() as u32)?;
+    buf.write_slice(&msg.data)?;
+    Ok(buf.into_inner())
+}
+
+fn decode_message(payload: &[u8]) -> anyhow::Result<MyMessage> {
+    let mut cursor = ReadCursor::new(payload);
+    let message_type = cursor.read_u16()?;
+    let data_len = cursor.read_u32()? as usize;
+    let data = cursor.read_slice(data_len)?.to_vec();
+
+    Ok(MyMessage { message_type, data })
+}
+```
+
+## Next Steps
+
+- [Building a Client](/guides/building-a-client) - Integrate channels into clients
+- [Building a Server](/guides/building-a-server) - Add channels to servers
+- [Async I/O](/guides/async-io) - Handle channels asynchronously

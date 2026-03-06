@@ -1,0 +1,392 @@
+---
+title: ironrdp-svc
+description: Traits to implement RDP static virtual channels
+---
+
+<Note>
+**Version:** 0.6.0  
+**Docs.rs:** [ironrdp-svc](https://docs.rs/ironrdp-svc/latest/ironrdp_svc/)
+</Note>
+
+## Overview
+
+The `ironrdp-svc` crate provides traits and utilities for implementing RDP Static Virtual Channels (SVCs). Static channels are:
+
+- Established during connection setup (up to 31 custom channels)
+- Lossless, ordered byte streams
+- Used for clipboard, file transfer, audio, device redirection, etc.
+
+This crate handles:
+- PDU chunkification (splitting large messages into ~1600 byte chunks)
+- Channel framing headers
+- MCS/X.224 wrapping
+
+## Core Traits
+
+### SvcProcessor
+
+```rust
+pub trait SvcProcessor: AsAny + fmt::Debug + Send {
+    fn channel_name(&self) -> ChannelName;
+    fn compression_condition(&self) -> CompressionCondition;
+    fn start(&mut self) -> PduResult<Vec<SvcMessage>>;
+    fn process(&mut self, payload: &[u8]) -> PduResult<Vec<SvcMessage>>;
+}
+```
+
+Implement this trait to create a custom static virtual channel.
+
+**Methods:**
+
+<ParamField path="channel_name" type="fn(&self) -> ChannelName">
+Returns the 7-character channel name (e.g., "CLIPRDR", "RDPDR")
+</ParamField>
+
+<ParamField path="compression_condition" type="fn(&self) -> CompressionCondition">
+Defines when channel data should be compressed (default: Never)
+</ParamField>
+
+<ParamField path="start" type="fn(&mut self) -> PduResult<Vec<SvcMessage>>">
+Called after the channel is joined. Returns initial PDUs to send (default: empty)
+</ParamField>
+
+<ParamField path="process" type="fn(&mut self, payload: &[u8]) -> PduResult<Vec<SvcMessage>>">
+Process a received PDU (fully de-chunkified). Returns response PDUs to send.
+</ParamField>
+
+### SvcClientProcessor & SvcServerProcessor
+
+```rust
+pub trait SvcClientProcessor: SvcProcessor {}
+pub trait SvcServerProcessor: SvcProcessor {}
+```
+
+Marker traits to distinguish client and server channel implementations.
+
+## Core Types
+
+### StaticVirtualChannel
+
+```rust
+pub struct StaticVirtualChannel { /* ... */ }
+
+impl StaticVirtualChannel {
+    pub fn new<T: SvcProcessor + 'static>(channel_processor: T) -> Self;
+    
+    pub fn channel_name(&self) -> ChannelName;
+    pub fn compression_condition(&self) -> CompressionCondition;
+    
+    pub fn start(&mut self) -> PduResult<Vec<SvcMessage>>;
+    pub fn process(&mut self, payload: &[u8]) -> PduResult<Vec<SvcMessage>>;
+    
+    pub fn chunkify(messages: Vec<SvcMessage>) -> EncodeResult<Vec<WriteBuf>>;
+    
+    pub fn channel_processor_downcast_ref<T: SvcProcessor + 'static>(&self) -> Option<&T>;
+    pub fn channel_processor_downcast_mut<T: SvcProcessor + 'static>(&mut self) -> Option<&mut T>;
+}
+```
+
+Wrapper around a `SvcProcessor` that handles chunking and framing.
+
+### SvcMessage
+
+```rust
+pub struct SvcMessage { /* ... */ }
+
+impl SvcMessage {
+    pub fn with_flags(self, flags: ChannelFlags) -> Self;
+    pub fn encode_unframed_pdu(&self) -> EncodeResult<Vec<u8>>;
+}
+
+impl<T: SvcEncode + 'static> From<T> for SvcMessage { /* ... */ }
+```
+
+A message to send over a static virtual channel. Automatically converted from any `SvcEncode` type.
+
+### SvcEncode
+
+```rust
+pub trait SvcEncode: Encode + Send {}
+```
+
+Marker trait for types that can be sent as SVC messages. Automatically implemented for types that implement `Encode`.
+
+**Example:**
+
+```rust
+use ironrdp_core::{Encode, WriteCursor, EncodeResult};
+use ironrdp_svc::SvcEncode;
+
+struct MyChannelPdu {
+    field1: u32,
+    field2: u16,
+}
+
+impl Encode for MyChannelPdu {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        dst.write_u32(self.field1);
+        dst.write_u16(self.field2);
+        Ok(())
+    }
+    
+    fn name(&self) -> &'static str { "MyChannelPdu" }
+    fn size(&self) -> usize { 6 }
+}
+
+impl SvcEncode for MyChannelPdu {}
+```
+
+### StaticChannelSet
+
+```rust
+pub struct StaticChannelSet { /* ... */ }
+
+impl StaticChannelSet {
+    pub fn new() -> Self;
+    
+    pub fn insert<T: SvcProcessor + 'static>(&mut self, val: T) -> Option<StaticVirtualChannel>;
+    
+    pub fn get_by_type<T: SvcProcessor + 'static>(&self) -> Option<&StaticVirtualChannel>;
+    pub fn get_by_type_mut<T: SvcProcessor + 'static>(&mut self) -> Option<&mut StaticVirtualChannel>;
+    
+    pub fn get_by_channel_id(&self, channel_id: StaticChannelId) -> Option<&StaticVirtualChannel>;
+    pub fn get_by_channel_id_mut(&mut self, channel_id: StaticChannelId) -> Option<&mut StaticVirtualChannel>;
+    
+    pub fn get_by_channel_name(&self, name: &ChannelName) -> Option<(TypeId, &StaticVirtualChannel)>;
+    
+    pub fn attach_channel_id(&mut self, type_id: TypeId, channel_id: StaticChannelId) -> Option<StaticChannelId>;
+    
+    pub fn iter(&self) -> impl Iterator<Item = (TypeId, &StaticVirtualChannel)>;
+    pub fn values(&self) -> impl Iterator<Item = &StaticVirtualChannel>;
+    pub fn channel_ids(&self) -> impl Iterator<Item = StaticChannelId>;
+}
+```
+
+A set holding at most one channel per `SvcProcessor` type. Maps between:
+- Type IDs (from `TypeId::of::<T>()`)
+- Channel names
+- Channel IDs (assigned by the server during connection)
+
+### CompressionCondition
+
+```rust
+pub enum CompressionCondition {
+    Never,
+    WhenRdpDataIsCompressed,
+    Always,
+}
+```
+
+Defines when virtual channel data should be compressed.
+
+## Channel Encoding
+
+### Client-Side Encoding
+
+```rust
+pub fn client_encode_svc_messages(
+    messages: Vec<SvcMessage>,
+    channel_id: u16,
+    initiator_id: u16,
+) -> EncodeResult<Vec<u8>>
+```
+
+Encode messages for sending from client to server. Handles:
+1. Chunkifying messages
+2. Adding Channel PDU Headers
+3. Wrapping in MCS Send Data Request
+4. Adding X.224 and TPKT framing
+
+Returns fully encoded bytes ready to send over the transport.
+
+### Server-Side Encoding
+
+```rust
+pub fn server_encode_svc_messages(
+    messages: Vec<SvcMessage>,
+    channel_id: u16,
+    initiator_id: u16,
+) -> EncodeResult<Vec<u8>>
+```
+
+Same as client encoding but uses MCS Send Data Indication.
+
+## Channel Definitions
+
+### make_channel_definition
+
+```rust
+pub fn make_channel_definition(channel: &StaticVirtualChannel) -> ChannelDef;
+pub fn make_channel_options(channel: &StaticVirtualChannel) -> ChannelOptions;
+```
+
+Create the `ChannelDef` structure to advertise during connection negotiation.
+
+## Implementation Example
+
+```rust
+use ironrdp_svc::*;
+use ironrdp_pdu::gcc::ChannelName;
+use ironrdp_core::{Encode, WriteCursor, EncodeResult};
+
+#[derive(Debug)]
+struct MyChannel {
+    state: u32,
+}
+
+impl MyChannel {
+    fn new() -> Self {
+        Self { state: 0 }
+    }
+}
+
+ironrdp_core::impl_as_any!(MyChannel);
+
+impl SvcProcessor for MyChannel {
+    fn channel_name(&self) -> ChannelName {
+        ChannelName::from_bytes(b"MYCHAN\x00").unwrap()
+    }
+    
+    fn start(&mut self) -> PduResult<Vec<SvcMessage>> {
+        // Send initial greeting
+        Ok(vec![MyGreetingPdu { version: 1 }.into()])
+    }
+    
+    fn process(&mut self, payload: &[u8]) -> PduResult<Vec<SvcMessage>> {
+        // Parse PDU from payload
+        let pdu = decode_my_pdu(payload)?;
+        
+        // Update state
+        self.state += 1;
+        
+        // Return response PDUs
+        Ok(vec![MyResponsePdu { state: self.state }.into()])
+    }
+}
+
+impl SvcClientProcessor for MyChannel {}
+
+struct MyGreetingPdu { version: u32 }
+impl Encode for MyGreetingPdu {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        dst.write_u32(self.version);
+        Ok(())
+    }
+    fn name(&self) -> &'static str { "MyGreetingPdu" }
+    fn size(&self) -> usize { 4 }
+}
+impl SvcEncode for MyGreetingPdu {}
+
+struct MyResponsePdu { state: u32 }
+impl Encode for MyResponsePdu {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        dst.write_u32(self.state);
+        Ok(())
+    }
+    fn name(&self) -> &'static str { "MyResponsePdu" }
+    fn size(&self) -> usize { 4 }
+}
+impl SvcEncode for MyResponsePdu {}
+```
+
+## Usage Example
+
+```rust
+use ironrdp_svc::*;
+use std::any::TypeId;
+
+// Create channel set
+let mut channels = StaticChannelSet::new();
+channels.insert(MyChannel::new());
+
+// Get channel definitions for connection negotiation
+let defs: Vec<_> = channels.values()
+    .map(make_channel_definition)
+    .collect();
+
+// After connection, attach server-assigned IDs
+channels.attach_channel_id(TypeId::of::<MyChannel>(), 1003);
+
+// Process received data
+if let Some(channel) = channels.get_by_channel_id_mut(1003) {
+    let responses = channel.process(&received_data)?;
+    
+    // Encode responses
+    let encoded = client_encode_svc_messages(responses, 1003, user_id)?;
+    // ... send encoded bytes
+}
+```
+
+## Channel Framing
+
+### ChannelFlags
+
+```rust
+bitflags! {
+    pub struct ChannelFlags: u32 {
+        const FIRST = 0x0000_0001;
+        const LAST = 0x0000_0002;
+        const SHOW_PROTOCOL = 0x0000_0010;
+        const SUSPEND = 0x0000_0020;
+        const RESUME = 0x0000_0040;
+        const SHADOW_PERSISTENT = 0x0000_0080;
+        const COMPRESSED = 0x0020_0000;
+        const AT_FRONT = 0x0040_0000;
+        const FLUSHED = 0x0080_0000;
+    }
+}
+```
+
+Flags in the Channel PDU Header. `FIRST` and `LAST` are set automatically during chunkification.
+
+### Chunk Size
+
+```rust
+pub const CHANNEL_CHUNK_LENGTH: usize = 1600;
+```
+
+Default maximum chunk size. Servers may advertise a larger size in capability sets.
+
+## Re-exports
+
+```rust
+pub use ironrdp_pdu as pdu; // Convenient access to PDU types
+```
+
+## Usage Notes
+
+<Note>
+**Automatic Chunkification:**  
+You don't need to manually chunk messages. `StaticVirtualChannel` handles it:
+
+```rust
+let large_pdu = MyPdu { data: vec![0u8; 10000] };
+let messages = vec![large_pdu.into()];
+let chunks = StaticVirtualChannel::chunkify(messages)?;
+// Creates ~7 chunks with appropriate FIRST/LAST flags
+```
+</Note>
+
+<Note>
+**Type-Safe Channel Access:**  
+Use `StaticChannelSet` to safely manage multiple channels:
+
+```rust
+let cliprdr = channels.get_by_type::<ClipboardChannel>();
+let rdpdr = channels.get_by_type::<DeviceRedirectionChannel>();
+```
+
+No string comparisons or manual casting needed.
+</Note>
+
+<Note>
+**Channel Limits:**  
+RDP supports up to 31 custom static virtual channels plus the mandatory I/O channel (32 total). Choose channel names carefully.
+</Note>
+
+## See Also
+
+- [ironrdp-dvc](/api/ironrdp-dvc) - Dynamic virtual channels
+- [ironrdp-pdu](/api/ironrdp-pdu) - PDU structures
+- [ironrdp-connector](/api/ironrdp-connector) - Connection setup
+- [MS-RDPBCGR §2.2.6](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/) - Virtual channel specification
