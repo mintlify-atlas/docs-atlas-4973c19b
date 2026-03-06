@@ -1,0 +1,155 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "IronRDP",
+  "projectDescription": "A Rust implementation of the Microsoft Remote Desktop Protocol (RDP) with a focus on security",
+  "theme": "aspen",
+  "primaryColor": "#7c7c7c",
+  "lightColor": "#101010",
+  "darkColor": "#cccccc",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/crate-tiers",
+              "architecture/design-principles"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/protocol-overview",
+              "concepts/connection-flow",
+              "concepts/virtual-channels",
+              "concepts/graphics-codecs"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/building-a-client",
+              "guides/building-a-server",
+              "guides/virtual-channels",
+              "guides/graphics-rendering",
+              "guides/async-io",
+              "guides/ffi-bindings",
+              "guides/webassembly"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core Tier",
+            "pages": [
+              "api/ironrdp-core",
+              "api/ironrdp-pdu",
+              "api/ironrdp-graphics",
+              "api/ironrdp-connector",
+              "api/ironrdp-session",
+              "api/ironrdp-input",
+              "api/ironrdp-svc",
+              "api/ironrdp-dvc"
+            ]
+          },
+          {
+            "group": "Virtual Channels",
+            "pages": [
+              "api/ironrdp-cliprdr",
+              "api/ironrdp-rdpdr",
+              "api/ironrdp-rdpsnd",
+              "api/ironrdp-displaycontrol"
+            ]
+          },
+          {
+            "group": "I/O & Integration",
+            "pages": [
+              "api/ironrdp-blocking",
+              "api/ironrdp-async",
+              "api/ironrdp-tokio",
+              "api/ironrdp-futures",
+              "api/ironrdp-tls"
+            ]
+          },
+          {
+            "group": "Client & Server",
+            "pages": [
+              "api/ironrdp-client",
+              "api/ironrdp-acceptor",
+              "api/ironrdp-server"
+            ]
+          },
+          {
+            "group": "Specialized",
+            "pages": [
+              "api/ironrdp-web",
+              "api/ironrdp-error",
+              "api/ffi"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Resources",
+        "groups": [
+          {
+            "group": "Examples & Contributing",
+            "pages": [
+              "examples/overview",
+              "examples/screenshot",
+              "examples/server",
+              "contributing",
+              "faq"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Modular crate architecture with strict tier system",
+    "Multiple video codec support (RemoteFX, RLE, RDP 6.0)",
+    "Static and dynamic virtual channels",
+    "Client and server implementations",
+    "Security-focused design with fuzzing",
+    "Cross-platform no_std compatibility",
+    "FFI bindings for C/C# and WebAssembly support",
+    "Async and blocking I/O abstractions"
+  ],
+  "publicApiSurface": [
+    "ironrdp - Meta crate re-exporting core functionality",
+    "ironrdp-core - Common traits (Encode, Decode, ReadCursor, WriteCursor)",
+    "ironrdp-pdu - PDU encoding/decoding for RDP protocol",
+    "ironrdp-graphics - Image processing and codec implementations",
+    "ironrdp-connector - RDP connection state machines",
+    "ironrdp-session - RDP session state machines",
+    "ironrdp-svc - Static virtual channel traits",
+    "ironrdp-dvc - Dynamic virtual channel implementation",
+    "ironrdp-cliprdr - CLIPRDR clipboard channel",
+    "ironrdp-rdpdr - RDPDR device redirection channel",
+    "ironrdp-rdpsnd - RDPSND audio output channel",
+    "ironrdp-input - Input packet utilities",
+    "ironrdp-blocking - Blocking I/O abstraction",
+    "ironrdp-async - Async Future wrappers",
+    "ironrdp-tokio - Tokio integration",
+    "ironrdp-futures - Futures integration",
+    "ironrdp-client - Portable RDP client",
+    "ironrdp-acceptor - Connection acceptance state machines",
+    "ironrdp-server - Extendable RDP server skeleton",
+    "ironrdp-web - WebAssembly bindings"
+  ]
+}
